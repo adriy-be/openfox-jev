@@ -82,19 +82,13 @@ const SETTINGS_FIELDS = [
   },
   {
     key: 'model',
-    type: 'select',
+    type: 'text',
     section: localized('Model', 'Modèle'),
     label: localized('Decision model', 'Modèle de décision'),
     description: localized(
       `Default: ${DEFAULT_MODEL}. Local Jev servers ignore this field.`,
       `Par défaut : ${DEFAULT_MODEL}. Les serveurs Jev locaux ignorent ce champ.`,
     ),
-    optionsFrom: 'models',
-    options: [
-      { value: DEFAULT_MODEL, label: localized(DEFAULT_MODEL, DEFAULT_MODEL) },
-      { value: 'jev-style', label: localized('jev-style (local server default)', 'jev-style (défaut du serveur local)') },
-      { value: '', label: localized('Auto (backend default)', 'Auto (défaut du backend)') },
-    ],
     default: '',
     placeholder: DEFAULT_MODEL,
   },
