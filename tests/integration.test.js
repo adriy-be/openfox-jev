@@ -123,11 +123,10 @@ describe('plugin registration (OpenFox API v2)', () => {
     assert.equal(enabled.default, false)
   })
 
-  it('the decision model is a select, not free text', () => {
+  it('the decision model is free text', () => {
     const model = registered.settings.fields.find((f) => f.key === 'model')
-    assert.equal(model.type, 'select')
-    assert.ok(Array.isArray(model.options) && model.options.length > 0, 'model select must declare options')
-    assert.ok(model.options.some((o) => o.value === ''))
+    assert.equal(model.type, 'text')
+    assert.equal(model.optionsFrom, undefined)
   })
 })
 
