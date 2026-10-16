@@ -61,10 +61,12 @@ never triggers a GPU workload.
 
 **Model**
 - *Decision provider* — dropdown of **existing** OpenFox providers (Provider
-  Manager). No API key fields exist in this plugin.
+  Manager). Cloud keys are never re-entered — the only credential field is the
+  optional `localApiKey` for the loopback Jev server.
 - *Backend type* — Auto (verified origin mapping), Local Jev-Style,
   OpenRouter, DeepInfra, or Custom (HTTPS required).
-- *Decision model* — default `nace-ai/drex-v2.0` (local servers ignore it).
+- *Decision model* — select populated from the chosen provider's models
+  (default `nace-ai/drex-v2.0`; local servers ignore it).
 - *Local Jev URL* — loopback only, default `http://127.0.0.1:8765`.
 - *Connection test* — shows provider · model · mode · latency.
 
@@ -109,7 +111,7 @@ to collect real approval cases before switching to enforce.
 ## Tests
 
 ```bash
-npm test        # node:test — 130 tests: providers, client, policy,
+npm test        # node:test — 144 tests: providers, client, policy,
                 # security, reviewer, integration (real loopback server)
 ```
 
@@ -117,8 +119,12 @@ npm test        # node:test — 130 tests: providers, client, policy,
 
 ```bash
 node benchmark/run.js --backend local --url http://127.0.0.1:8765
+node benchmark/run.js --backend jev-0.8b --url http://127.0.0.1:8765
+node benchmark/run.js --backend jev-2b   --url http://127.0.0.1:8766
+node benchmark/run.js --backend jev-0.8b,jev-2b --url :8765 --url-2b :8766  # 0.8B vs 2B
 node benchmark/run.js --backend openrouter --api-key $OPENROUTER_API_KEY
 node benchmark/run.js --backend deepinfra  --api-key $DEEPINFRA_API_KEY
+node benchmark/run.js --backend deepinfra --api-key $DEEPINFRA_API_KEY --model <id>
 ```
 
 Same labelled corpus (`benchmarks/holdout.jsonl`, 24 samples) and the same
@@ -138,7 +144,7 @@ differences because every route runs the identical question set.
   workspace confirmations). `ask_user` and night-mode/sub-agent flows are
   untouched by design.
 - Local Jev servers ignore the `model` field — 0.8B vs 2B is a server-side
-  choice.
+  choice, benchmarked via the `jev-0.8b` / `jev-2b` backends (separate URLs).
 - Thresholds are conservative defaults; tune with labelled data
   (`benchmark/run.js`).
 - Cloud cost estimates use configurable per-token prices — verify against

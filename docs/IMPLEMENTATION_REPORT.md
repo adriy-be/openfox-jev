@@ -27,7 +27,8 @@
 ### Standalone plugin (`openfox-jev`, JS ESM, zero deps)
 - `src/index.js` — API v2 registration: FR/EN settings (general/model/policy/
   privacy), approval reviewer, RPCs (`testConnection`, `connectionStatus`,
-  `listBackends`). No API key fields.
+  `listBackends`). Cloud keys are never re-entered — the only credential
+  field is the optional `localApiKey` for the loopback Jev server.
 - `src/reviewer.js` — orchestration: config → mandatory security → provider
   lifecycle/consent → transport → validation → policy → shadow/enforce →
   audit. Default mode `shadow`, default disabled.
