@@ -315,17 +315,43 @@ describe('backend failures', () => {
     for (const result of results) assert.equal(result.action, 'allow')
   })
 
-  it('cancelled operation: abort signal short-circuits the transport', async () => {
+  it('pre-aborted session: no backend contact, safe escalation', async () => {
+    let called = 0
     const controller = new AbortController()
     controller.abort()
-    const access = makeProviderAccess([OPENROUTER], async (_id, _key, _body, options) => {
-      // Simulate a transport honoring the signal
-      throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })
+    const access = makeProviderAccess([OPENROUTER], async () => {
+      called += 1
+      return validResponse()
     })
     const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'x' }, access)
     const result = await reviewer.evaluate({ ...ROUTINE, signal: controller.signal })
+    assert.equal(called, 0)
     assert.equal(result.action, 'ask')
+    assert.equal(result.meta.ruleId, 'cancelled')
     assert.equal(result.meta.humanApprovalRequired, true)
+  })
+
+  it('mid-flight cancellation aborts the backend request and never allows', async () => {
+    let sawSignal = null
+    const access = makeProviderAccess([OPENROUTER], (_id, _key, _body, options) => {
+      sawSignal = options?.signal
+      return new Promise((resolve, reject) => {
+        const signal = options?.signal
+        if (signal?.aborted) return reject(signal.reason ?? Object.assign(new Error('aborted'), { name: 'AbortError' }))
+        signal?.addEventListener('abort', () => reject(signal.reason ?? Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true })
+      })
+    })
+    const controller = new AbortController()
+    const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'x', timeoutMs: 30_000 }, access)
+    const started = Date.now()
+    const pending = reviewer.evaluate({ ...ROUTINE, signal: controller.signal })
+    setTimeout(() => controller.abort(), 10)
+    const result = await pending
+    assert.ok(sawSignal instanceof AbortSignal, 'the transport must receive the cancellation signal')
+    assert.equal(result.action, 'ask', 'a cancelled operation must never be allowed')
+    assert.equal(result.meta.errorClass, 'cancelled')
+    assert.equal(result.meta.humanApprovalRequired, true)
+    assert.ok(Date.now() - started < 5_000, 'cancellation must not wait for the full backend timeout')
   })
 })
 
@@ -344,6 +370,13 @@ describe('audit logging', () => {
     assert.equal(row.humanApprovalRequired, false)
     assert.match(row.operationHash, /^[0-9a-f]{8}$/)
     assert.ok(!JSON.stringify(row).includes('Bearer'))
+  })
+
+  it('auditEnabled=false writes nothing', async () => {
+    const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'x', auditEnabled: false })
+    const result = await reviewer.evaluate(ROUTINE)
+    assert.equal(result.action, 'allow')
+    assert.equal(existsSync(join(auditDir, 'decisions.jsonl')), false, 'audit log must not be created when audit logging is disabled')
   })
 
   it('never stores raw secrets', async () => {

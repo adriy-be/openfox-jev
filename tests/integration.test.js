@@ -122,6 +122,13 @@ describe('plugin registration (OpenFox API v2)', () => {
     const enabled = registered.settings.fields.find((f) => f.key === 'enabled')
     assert.equal(enabled.default, false)
   })
+
+  it('the decision model is a select, not free text', () => {
+    const model = registered.settings.fields.find((f) => f.key === 'model')
+    assert.equal(model.type, 'select')
+    assert.ok(Array.isArray(model.options) && model.options.length > 0, 'model select must declare options')
+    assert.ok(model.options.some((o) => o.value === ''))
+  })
 })
 
 describe('end-to-end approval lifecycle (mocked provider)', () => {
@@ -413,5 +420,82 @@ describe('audit log integration', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+
+  it('audit toggle off (register-level): no JSONL is written', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jev-audit-off-'))
+    try {
+      process.env.OPENFOX_JEV_LOG = join(dir, 'should-not-exist.jsonl')
+      const registered = makeRegistry(
+        { enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Routine git allowed.', auditEnabled: false },
+        providerAccessStub([OPENROUTER], async () => jevAnswer('APPROVE')),
+      )
+      const result = await registered.reviewers[0].evaluate(ROUTINE)
+      assert.equal(result.action, 'allow')
+      const { existsSync } = await import('node:fs')
+      assert.equal(existsSync(join(dir, 'should-not-exist.jsonl')), false, 'register()-created audit must honor the auditEnabled toggle')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('local Jev-Style backend cancellation over real loopback HTTP', () => {
+  let server
+  let port
+  let hits
+
+  before(async () => {
+    hits = []
+    server = createServer((req, res) => {
+      let body = ''
+      req.on('data', (chunk) => {
+        body += chunk
+      })
+      req.on('end', () => {
+        if (req.url === '/v1/systemone' && req.method === 'POST') {
+          hits.push(JSON.parse(body))
+          // Deliberately slow: the cancellation test must abort before the
+          // response arrives, proving the signal reaches the local fetch.
+          setTimeout(() => {
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify(jevAnswer('APPROVE')))
+          }, 2_000)
+          return
+        }
+        res.writeHead(404)
+        res.end()
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    port = server.address().port
+  })
+
+  after(() => {
+    server.close()
+  })
+
+  it('aborts a slow local backend request and never allows', async () => {
+    const registered = makeRegistry(
+      {
+        enabled: true,
+        mode: 'enforce',
+        providerId: '',
+        backendKind: 'local',
+        localUrl: `http://127.0.0.1:${port}`,
+        operatorPolicy: 'x',
+        timeoutMs: 30_000,
+      },
+      undefined,
+    )
+    const controller = new AbortController()
+    const started = Date.now()
+    const pending = registered.reviewers[0].evaluate({ ...ROUTINE, signal: controller.signal })
+    setTimeout(() => controller.abort(), 10)
+    const result = await pending
+    assert.ok(Date.now() - started < 5_000, 'cancellation must not wait for the full backend timeout')
+    assert.equal(result.action, 'ask', 'a cancelled local operation must never be allowed')
+    assert.equal(result.meta.errorClass, 'cancelled')
+    assert.equal(result.meta.humanApprovalRequired, true)
   })
 })

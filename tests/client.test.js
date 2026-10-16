@@ -184,4 +184,63 @@ describe('decide()', () => {
     assert.equal(classifyError(new Error('Provider request failed with status 500')), 'http_error')
     assert.equal(classifyError(new Error('Provider returned an invalid JSON response')), 'invalid_response')
   })
+
+  it('classifyError distinguishes cancellation from timeout', () => {
+    assert.equal(classifyError(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })), 'cancelled')
+    assert.equal(classifyError(Object.assign(new Error('timed out'), { name: 'TimeoutError' })), 'timeout')
+  })
+
+  it('passes the cancellation signal to the transport', async () => {
+    const controller = new AbortController()
+    let sawSignal = null
+    const result = await decide({
+      transport: async (_key, _body, _timeoutMs, signal) => {
+        sawSignal = signal
+        return validResponse()
+      },
+      endpointKey: 'decisions',
+      model: 'm',
+      state: 'x',
+      signal: controller.signal,
+    })
+    assert.equal(result.ok, true)
+    assert.equal(sawSignal, controller.signal, 'transport must receive the caller signal')
+  })
+
+  it('pre-aborted signal short-circuits without contacting the backend', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    let transportCalled = false
+    const result = await decide({
+      transport: async () => {
+        transportCalled = true
+        return validResponse()
+      },
+      endpointKey: 'decisions',
+      model: 'm',
+      state: 'x',
+      signal: controller.signal,
+    })
+    assert.equal(transportCalled, false, 'no backend contact when already cancelled')
+    assert.equal(result.ok, false)
+    assert.equal(result.errorClass, 'cancelled')
+  })
+
+  it('abort during flight classifies as cancelled, never approved', async () => {
+    const controller = new AbortController()
+    const pending = decide({
+      transport: (_key, _body, _timeoutMs, signal) =>
+        new Promise((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true })
+        }),
+      endpointKey: 'decisions',
+      model: 'm',
+      state: 'x',
+      signal: controller.signal,
+    })
+    setTimeout(() => controller.abort(), 5)
+    const out = await pending
+    assert.equal(out.ok, false)
+    assert.equal(out.errorClass, 'cancelled')
+  })
 })

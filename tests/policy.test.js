@@ -131,6 +131,49 @@ describe('secrets and exfiltration', () => {
   })
 })
 
+describe('destructive operations', () => {
+  it('a destructive operation is never auto-approved on probability alone', () => {
+    const result = applyPolicy(answers({ destructive: { noul: 0.97 } }), baseInput)
+    assert.equal(result.decision, 'ESCALATE')
+    assert.equal(result.rule_id, 'destructive')
+  })
+
+  it('destructive + model DENY denies', () => {
+    const result = applyPolicy(
+      answers({
+        destructive: { noul: 0.97 },
+        verdict: { choice: 'DENY', confidence: 0.9, probabilities: { APPROVE: 0.02, ESCALATE: 0.08, DENY: 0.9 } },
+      }),
+      baseInput,
+    )
+    assert.equal(result.decision, 'DENY')
+    assert.equal(result.rule_id, 'destructive_deny')
+  })
+
+  it('destructive below threshold does not block approval', () => {
+    const result = applyPolicy(answers({ destructive: { noul: 0.3 } }), baseInput)
+    assert.equal(result.decision, 'APPROVE')
+  })
+})
+
+describe('contradictory answers', () => {
+  it('a verdict contradicting its own probability distribution escalates', () => {
+    const result = applyPolicy(
+      answers({
+        verdict: { choice: 'APPROVE', confidence: 0.9, probabilities: { APPROVE: 0.2, ESCALATE: 0.3, DENY: 0.5 } },
+      }),
+      baseInput,
+    )
+    assert.equal(result.decision, 'ESCALATE')
+    assert.equal(result.rule_id, 'contradictory_verdict')
+  })
+
+  it('a consistent verdict is not treated as contradictory', () => {
+    const result = applyPolicy(answers(), baseInput)
+    assert.equal(result.decision, 'APPROVE')
+  })
+})
+
 describe('confidence, probability and blast radius', () => {
   it('low confidence escalates an APPROVE verdict', () => {
     const result = applyPolicy(
