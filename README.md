@@ -65,8 +65,8 @@ never triggers a GPU workload.
   optional `localApiKey` for the loopback Jev server.
 - *Backend type* — Auto (verified origin mapping), Local Jev-Style,
   OpenRouter, DeepInfra, or Custom (HTTPS required).
-- *Decision model* — select populated from the chosen provider's models
-  (default `nace-ai/drex-v2.0`; local servers ignore it).
+- *Decision model* — free text (default `nace-ai/drex-v2.0`; local servers
+  ignore it).
 - *Local Jev URL* — loopback only, default `http://127.0.0.1:8765`.
 - *Connection test* — shows provider · model · mode · latency.
 
