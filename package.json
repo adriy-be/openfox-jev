@@ -1,0 +1,28 @@
+{
+  "name": "openfox-jev",
+  "version": "1.0.0",
+  "description": "Intelligent tool approval for OpenFox — System One decision models (Jev-Style local, Drex v2.0 via OpenRouter/DeepInfra) with a deterministic approval policy.",
+  "type": "module",
+  "main": "./src/index.js",
+  "author": "adriy-be",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test 'tests/*.test.js'",
+    "bench": "node benchmark/run.js"
+  },
+  "openfox": {
+    "apiVersion": 2,
+    "entry": "./src/index.js",
+    "displayName": "Jev Smart Approvals",
+    "description": "Replaces manual approval prompts with intelligent decisions from a System One compatible decision model, reusing OpenFox providers.",
+    "icon": "shield",
+    "capabilities": ["settings", "rpc", "providers"],
+    "timeoutMs": 30000
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "openfox": ">=2.0.140"
+  }
+}
