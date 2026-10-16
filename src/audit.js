@@ -23,6 +23,7 @@ export function defaultLogPath() {
  */
 export function createAuditLog({ filePath = defaultLogPath(), maxBytes = DEFAULT_MAX_BYTES, keep = DEFAULT_KEEP, enabled = true } = {}) {
   const state = { failures: 0 }
+  const isEnabled = () => (typeof enabled === 'function' ? enabled() : enabled)
 
   function rotateIfNeeded() {
     try {
@@ -39,7 +40,7 @@ export function createAuditLog({ filePath = defaultLogPath(), maxBytes = DEFAULT
   }
 
   function write(line) {
-    if (!enabled) return
+    if (!isEnabled()) return
     try {
       mkdirSync(dirname(filePath), { recursive: true })
       rotateIfNeeded()

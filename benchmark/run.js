@@ -19,9 +19,13 @@
  *
  * Usage:
  *   node benchmark/run.js --backend local --url http://127.0.0.1:8765
+ *   node benchmark/run.js --backend jev-0.8b --url http://127.0.0.1:8765
+ *   node benchmark/run.js --backend jev-2b   --url http://127.0.0.1:8766
+ *   node benchmark/run.js --backend jev-0.8b,jev-2b --url :8765 --url-2b :8766  # 0.8B vs 2B
  *   node benchmark/run.js --backend openrouter --api-key $OPENROUTER_API_KEY
  *   node benchmark/run.js --backend deepinfra --api-key $DEEPINFRA_API_KEY
  *   node benchmark/run.js --backend all --labelled benchmarks/holdout.jsonl
+ *   --model <id> overrides the model identifier sent to the backend.
  *
  * NOTE: benchmarks measure agreement with labelled fixtures. They are NOT
  * equivalent to real-world safety results.
@@ -39,14 +43,28 @@ const BACKENDS = {
     label: 'Jev-Style local',
     endpoint: args.url || process.env.JEV_URL || 'http://127.0.0.1:8765',
     path: '/v1/systemone',
-    model: 'jev-style',
+    model: args.model || 'jev-style',
+    remote: false,
+  },
+  'jev-0.8b': {
+    label: 'Jev-Style 0.8B (local)',
+    endpoint: args['url-0.8b'] || process.env.JEV_URL_08B || args.url || 'http://127.0.0.1:8765',
+    path: '/v1/systemone',
+    model: args.model || 'jev-style-0.8b',
+    remote: false,
+  },
+  'jev-2b': {
+    label: 'Jev-Style 2B (local)',
+    endpoint: args['url-2b'] || process.env.JEV_URL_2B || args.url || 'http://127.0.0.1:8766',
+    path: '/v1/systemone',
+    model: args.model || 'jev-style-2b',
     remote: false,
   },
   openrouter: {
     label: 'Drex v2.0 via OpenRouter',
     endpoint: 'https://openrouter.ai',
     path: '/api/alpha/decisions',
-    model: 'nace-ai/drex-v2.0',
+    model: args.model || 'nace-ai/drex-v2.0',
     remote: true,
     key: args['api-key'] || process.env.OPENROUTER_API_KEY,
   },
@@ -54,7 +72,7 @@ const BACKENDS = {
     label: 'Drex v2.0 via DeepInfra',
     endpoint: 'https://api.deepinfra.com',
     path: '/v1/decisions',
-    model: 'nace-ai/drex-v2.0',
+    model: args.model || 'nace-ai/drex-v2.0',
     remote: true,
     key: args['api-key'] || process.env.DEEPINFRA_API_KEY,
   },
@@ -209,7 +227,11 @@ function summarize(rows, backend, inputTokens) {
 
 async function main() {
   const corpus = loadCorpus(args.labelled)
-  const requested = args.backend && args.backend !== 'all' ? [args.backend] : ['local', 'openrouter', 'deepinfra']
+  const allBackends = ['local', 'jev-0.8b', 'jev-2b', 'openrouter', 'deepinfra']
+  const requested =
+    args.backend && args.backend !== 'all'
+      ? String(args.backend).split(',').map((s) => s.trim()).filter(Boolean)
+      : allBackends
   const hasPolicy = args['no-policy'] ? false : true
 
   console.log(`openfox-jev benchmark — ${corpus.length} labelled samples, ${requested.length} backend(s)`)

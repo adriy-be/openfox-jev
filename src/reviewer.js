@@ -1,4 +1,4 @@
-import { decide, DEFAULT_MODEL as CLIENT_DEFAULT_MODEL, QUESTIONS } from './client.js'
+import { decide, DEFAULT_MODEL as CLIENT_DEFAULT_MODEL, QUESTIONS, combineSignals } from './client.js'
 import { applyPolicy, POLICY_VERSION, DEFAULT_THRESHOLDS } from './policy.js'
 import { evaluateSecurity, redactState } from './security.js'
 import { createAuditLog } from './audit.js'
@@ -81,7 +81,7 @@ function transportFor(providerAccess, provider, config) {
     // Credentials are never attached here — cloud credentials only ever flow
     // through providerAccess.requestJson with a verified origin mapping.
     const target = url
-    return async (key, body, timeoutMs) => {
+    return async (key, body, timeoutMs, signal) => {
       const headers = { 'Content-Type': 'application/json' }
       if (config.localApiKey && isLoopbackUrl(target)) headers['Authorization'] = `Bearer ${config.localApiKey}`
       const response = await fetch(target, {
@@ -89,7 +89,7 @@ function transportFor(providerAccess, provider, config) {
         headers,
         body: JSON.stringify(body),
         redirect: 'error',
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: combineSignals(timeoutMs, signal),
       })
       if (!response.ok) throw new Error(`Provider request failed with status ${response.status}`)
       const text = await response.text()
@@ -102,7 +102,8 @@ function transportFor(providerAccess, provider, config) {
     }
   }
 
-  return (key, body, timeoutMs) => providerAccess.requestJson(provider.id, key, body, { timeoutMs })
+  return (key, body, timeoutMs, signal) =>
+    providerAccess.requestJson(provider.id, key, body, signal ? { timeoutMs, signal } : { timeoutMs })
 }
 
 /**
@@ -129,6 +130,7 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
       model,
       state: safeState,
       timeoutMs: config.timeoutMs,
+      signal: context.signal,
     })
     return { ...result, model, redacted, state: safeState, kind }
   }
@@ -155,6 +157,7 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
   }
 
   function record(config, provider, context, meta, operationText) {
+    if (!config.auditEnabled) return
     try {
       log.record({
         mode: config.mode,
@@ -189,6 +192,14 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
     const operationText = context.command || context.description || (context.paths ?? []).join(' ') || context.tool || ''
 
     if (!config.enabled) return { action: 'ask', reason: 'Smart approvals disabled.', meta: { decision: 'ESCALATE', ruleId: 'disabled', humanApprovalRequired: true } }
+
+    // A cancelled operation is never auto-approved: fail closed to the native
+    // confirmation flow without contacting the backend.
+    if (context.signal?.aborted) {
+      const meta = { decision: 'ESCALATE', ruleId: 'cancelled', outcome: 'escalated_cancelled', humanApprovalRequired: true, errorClass: 'cancelled' }
+      record(config, null, context, meta, operationText)
+      return { action: 'ask', reason: 'Operation was cancelled; falling back to manual confirmation.', meta }
+    }
 
     // Mandatory deterministic security rules run first and are not optional.
     const security = evaluateSecurity(context)
@@ -240,7 +251,8 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
     }
 
     if (!assessment.ok) {
-      const ruleId = assessment.errorClass === 'invalid_response' ? 'invalid_response' : 'backend_error'
+      const ruleId =
+        assessment.errorClass === 'invalid_response' ? 'invalid_response' : assessment.errorClass === 'cancelled' ? 'cancelled' : 'backend_error'
       const meta = {
         decision: 'ESCALATE',
         ruleId,

@@ -71,6 +71,17 @@ export function truncateState(state, maxChars = MAX_STATE_CHARS) {
   }
 }
 
+/**
+ * Combine the strict request timeout with an optional caller cancellation
+ * signal. The caller's abort wins immediately; the timeout still bounds
+ * requests that carry no signal.
+ */
+export function combineSignals(timeoutMs, signal) {
+  const timeout = AbortSignal.timeout(timeoutMs)
+  if (!signal) return timeout
+  return typeof AbortSignal.any === 'function' ? AbortSignal.any([timeout, signal]) : signal
+}
+
 function isFiniteNumber(value) {
   return typeof value === 'number' && Number.isFinite(value)
 }
@@ -136,12 +147,15 @@ export function validateResponse(raw, { truncated = false } = {}) {
  *   { ok: false, errorClass, error, latencyMs }
  * Never throws; never uses chat completions or free-form text.
  */
-export async function decide({ transport, endpointKey, model, state, timeoutMs = DEFAULT_TIMEOUT_MS, maxStateChars = MAX_STATE_CHARS }) {
+export async function decide({ transport, endpointKey, model, state, timeoutMs = DEFAULT_TIMEOUT_MS, maxStateChars = MAX_STATE_CHARS, signal }) {
   const started = Date.now()
   const { state: truncatedState, truncated } = truncateState(state, maxStateChars)
   const body = buildRequest(truncatedState, model)
+  if (signal?.aborted) {
+    return { ok: false, errorClass: 'cancelled', error: 'Operation cancelled before the request was sent', latencyMs: 0, truncated }
+  }
   try {
-    const raw = await transport(endpointKey, body, timeoutMs)
+    const raw = await transport(endpointKey, body, timeoutMs, signal)
     const { answers, errors } = validateResponse(raw, { truncated })
     const latencyMs = Date.now() - started
     if (errors.length > 0) {
@@ -158,8 +172,11 @@ export async function decide({ transport, endpointKey, model, state, timeoutMs =
 
 export function classifyError(error) {
   const message = error instanceof Error ? error.message : String(error)
-  if (error?.name === 'TimeoutError' || error?.name === 'AbortError' || /timed? ?out|timeout/i.test(message)) {
+  if (error?.name === 'TimeoutError' || /timed? ?out|timeout/i.test(message)) {
     return 'timeout'
+  }
+  if (error?.name === 'AbortError' || error?.name === 'CanceledError' || /abort|cancel/i.test(message)) {
+    return 'cancelled'
   }
   if (/Provider not found|disabled|no configured credentials|auth adapter|missing or expired/i.test(message)) {
     return 'provider_unavailable'

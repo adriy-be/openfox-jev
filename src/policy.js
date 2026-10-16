@@ -6,6 +6,7 @@ export const DEFAULT_THRESHOLDS = {
   selfAdvocating: 0.6,
   readsSecrets: 0.7,
   exfiltration: 0.7,
+  destructive: 0.7,
   policyAllows: 0.7,
   maxBlastRadius: 2.0,
   escalateBlastRadius: 1.6,
@@ -91,9 +92,20 @@ export function applyPolicy(answers, input = {}, thresholds = {}, context = {}) 
   const selfAdvocating = noul(answers, 'self_advocating') ?? 0
   const readsSecrets = noul(answers, 'reads_secrets') ?? 0
   const exfiltration = noul(answers, 'exfiltration') ?? 0
+  const destructive = noul(answers, 'destructive') ?? 0
   const policyAllows = noul(answers, 'policy_allows') ?? 0
   const blastRadius = scoreValue(answers, 'blast_radius')
   const blast = typeof blastRadius === 'number' ? blastRadius : t.escalateBlastRadius
+
+  // Rule 3b: a verdict that contradicts its own probability distribution is
+  // never acted on — the model chose an option that is not the most probable.
+  if (verdict && verdict.probabilities) {
+    const maxProbability = Math.max(...VERDICTS.map((key) => verdict.probabilities[key] ?? -1))
+    const chosen = verdict.probabilities[verdict.choice] ?? -1
+    if (chosen < maxProbability) {
+      return result('ESCALATE', 'contradictory_verdict', 'The model verdict contradicts its own probability distribution.', modelVerdict, confidence)
+    }
+  }
 
   // Rule 4: prompt-injection signal runs first so policy can never be talked
   // into approving an operation that advocates for its own approval.
@@ -122,6 +134,15 @@ export function applyPolicy(answers, input = {}, thresholds = {}, context = {}) 
       return result('DENY', 'exfiltration_deny', 'The operation transmits sensitive local data externally.', modelVerdict, confidence)
     }
     return result('ESCALATE', 'exfiltration', 'The operation transmits sensitive local data to an external destination.', modelVerdict, confidence)
+  }
+
+  // Rule 6b: destructive operations are never auto-approved on model
+  // probability alone — they require a human decision (or a model deny).
+  if (destructive >= t.destructive) {
+    if (modelVerdict === 'DENY') {
+      return result('DENY', 'destructive_deny', 'The operation destroys or irreversibly modifies valuable data.', modelVerdict, confidence)
+    }
+    return result('ESCALATE', 'destructive', 'The operation could destroy or irreversibly modify valuable data.', modelVerdict, confidence)
   }
 
   // Rule 7: low-confidence or contradictory answers escalate.
