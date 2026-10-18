@@ -5,6 +5,7 @@ import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
 import { createReviewer, readConfig, buildState } from '../src/reviewer.js'
 import { createAuditLog } from '../src/audit.js'
+import { evaluateSecurity } from '../src/security.js'
 
 function validResponse(choice = 'APPROVE', overrides = {}) {
   return {
@@ -115,6 +116,19 @@ describe('configuration', () => {
       { operatorPolicy: 'x' },
     )
     assert.match(state.command, /File access request: read_file wants read access to \/w\/data\.json/)
+  })
+
+  it('empty command + dangerous description: security rules and model state receive the same effective operation', () => {
+    const context = { kind: 'command', tool: 'run_command', command: '', description: 'rm -rf /', workdir: '/w' }
+    assert.equal(buildState(context, { operatorPolicy: 'x' }).command, 'rm -rf /', 'the model judges the description')
+    assert.equal(evaluateSecurity(context).decision, 'DENY', 'the deterministic rules judge the same text')
+  })
+
+  it('whitespace-only command + dangerous description: rules and model still agree on the description', () => {
+    const context = { kind: 'command', tool: 'run_command', command: '  \t ', description: 'sudo reboot', workdir: '/w' }
+    assert.equal(buildState(context, { operatorPolicy: 'x' }).command, 'sudo reboot')
+    assert.equal(evaluateSecurity(context).decision, 'ESCALATE')
+    assert.equal(evaluateSecurity(context).ruleId, 'privilege_escalation')
   })
 })
 
@@ -273,6 +287,19 @@ describe('mandatory security rules precede the model', () => {
     const result = await reviewer.evaluate({ kind: 'path', tool: 'write_file', paths: ['/etc/hosts'], workdir: '/w', sessionId: 's1' })
     assert.equal(result.action, 'ask')
     assert.equal(result.meta.ruleId, 'write_outside_project')
+  })
+
+  it('denies an empty command with a dangerous description without contacting the backend', async () => {
+    let called = 0
+    const access = makeProviderAccess([OPENROUTER], async () => {
+      called += 1
+      return validResponse('APPROVE')
+    })
+    const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'x' }, access)
+    const result = await reviewer.evaluate({ ...ROUTINE, command: '', description: 'rm -rf /' })
+    assert.equal(result.action, 'deny')
+    assert.equal(result.meta.ruleId, 'wipe_home_or_root')
+    assert.equal(called, 0, 'the deterministic DENY must fire before any model contact')
   })
 })
 

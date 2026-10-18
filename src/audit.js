@@ -36,6 +36,7 @@ export function keyedHash(key, text) {
 export function createAuditLog({ filePath = defaultLogPath(), maxBytes = DEFAULT_MAX_BYTES, keep = DEFAULT_KEEP, enabled = true, verboseOperation = false, hmacKey } = {}) {
   const state = { failures: 0 }
   const isEnabled = () => (typeof enabled === 'function' ? enabled() : enabled)
+  const isVerbose = () => (typeof verboseOperation === 'function' ? verboseOperation() : verboseOperation)
   // Keyed fingerprint: operator-supplied key wins, else a random per-process
   // key. A random key keeps the log non-correlatable across processes.
   const key = hmacKey ?? (process.env.OPENFOX_JEV_AUDIT_KEY ? Buffer.from(process.env.OPENFOX_JEV_AUDIT_KEY) : randomBytes(32))
@@ -88,8 +89,9 @@ export function createAuditLog({ filePath = defaultLogPath(), maxBytes = DEFAULT
         operationCategory: record.operationCategory ?? null,
         operationHash: operation ? keyedHash(key, redactedOp) : null,
         // Metadata-only by default: the raw (redacted) operation text is only
-        // written when verboseOperation is explicitly enabled.
-        operationRedacted: verboseOperation && operation ? redactedOp.slice(0, 200) : null,
+        // written when verboseOperation is explicitly enabled. A callback is
+        // re-evaluated per record so live setting changes apply immediately.
+        operationRedacted: isVerbose() && operation ? redactedOp.slice(0, 200) : null,
         rawVerdict: record.rawVerdict ?? null,
         decision: record.decision ?? null,
         ruleId: record.ruleId ?? null,

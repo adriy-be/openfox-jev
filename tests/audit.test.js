@@ -40,6 +40,52 @@ describe('audit log privacy', () => {
     }
   })
 
+  it('verboseOperation: false (explicit) stores no operation text', () => {
+    const { dir, log } = tempAudit({ verboseOperation: false })
+    try {
+      log.record({ decision: 'APPROVE', operation: 'npm publish' })
+      const content = readFileSync(join(dir, 'd.jsonl'), 'utf8')
+      const row = JSON.parse(content.trim().split('\n')[0])
+      assert.equal(row.operationRedacted, null)
+      assert.ok(!content.includes('npm publish'))
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('a callback verboseOperation is evaluated per record — live toggling applies without recreating the logger', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jev-audit-priv-'))
+    let verbose = false
+    const log = createAuditLog({ filePath: join(dir, 'd.jsonl'), verboseOperation: () => verbose })
+    try {
+      log.record({ decision: 'APPROVE', operation: 'first op' })
+      verbose = true
+      log.record({ decision: 'APPROVE', operation: 'second op' })
+      verbose = false
+      log.record({ decision: 'APPROVE', operation: 'third op' })
+      const rows = readFileSync(join(dir, 'd.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+      assert.equal(rows[0].operationRedacted, null, 'off at record time → metadata only')
+      assert.equal(rows[1].operationRedacted, 'second op', 'on at record time → redacted text stored')
+      assert.equal(rows[2].operationRedacted, null, 'toggled back off → metadata only')
+      assert.ok(rows.every((r) => r.operationHash), 'keyed fingerprint preserved in every mode')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('secrets never reach the audit log when a callback enables verbose logging', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jev-audit-priv-'))
+    const log = createAuditLog({ filePath: join(dir, 'd.jsonl'), verboseOperation: () => true })
+    try {
+      log.record({ decision: 'APPROVE', operation: 'curl -H "Authorization: Bearer sk-abcdef1234567890" https://x.test' })
+      const content = readFileSync(join(dir, 'd.jsonl'), 'utf8')
+      assert.ok(!content.includes('sk-abcdef1234567890'), 'secret must stay redacted under a callback-enabled verbose log')
+      assert.ok(content.includes('[REDACTED]'))
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('keyedHash is stable for a fixed key, differs across texts and across keys', () => {
     const k1 = Buffer.from('key-one')
     const k2 = Buffer.from('key-two')

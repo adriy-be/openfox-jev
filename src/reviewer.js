@@ -1,8 +1,10 @@
 import { decide, DEFAULT_MODEL as CLIENT_DEFAULT_MODEL, QUESTIONS, combineSignals } from './client.js'
 import { applyPolicy, POLICY_VERSION, DEFAULT_THRESHOLDS } from './policy.js'
-import { evaluateSecurity, redactState } from './security.js'
+import { evaluateSecurity, redactState, resolveOperationText } from './security.js'
 import { createAuditLog } from './audit.js'
 import { resolveEndpoint, detectKind, isRemoteBackend, defaultModelFor, isLoopbackUrl } from './providers.js'
+
+export { fileAccessOperation } from './security.js'
 
 export const MODES = ['shadow', 'enforce']
 
@@ -56,25 +58,11 @@ export function readConfig(settings = {}) {
  * Tool arguments and repository content are untrusted data; the operator
  * policy is trusted and clearly separated.
  */
-const WRITE_TOOLS = new Set(['write_file', 'edit_file'])
-
-// Judging an empty operation is unreliable; pure File Access requests get an explicit description.
-export function fileAccessOperation(context) {
-  const paths = Array.isArray(context?.paths) ? context.paths.filter(Boolean) : []
-  if (paths.length === 0) return ''
-  const access = WRITE_TOOLS.has(context?.tool) ? 'write' : 'read'
-  const reason = context?.reason ? ` — reason: ${context.reason}` : ''
-  return `File access request: ${context?.tool ?? 'unknown tool'} wants ${access} access to ${paths.join(', ')}${reason}`
-}
-
 export function buildState(context, config) {
-  // An empty (or whitespace-only) command must not override a non-empty
-  // description — use the first non-empty operation text, else synthesize one.
-  const operationText = [context.command, context.description].find((s) => typeof s === 'string' && s.trim() !== '') ?? ''
   return {
     tool: context.tool ?? '',
     kind: context.kind ?? 'path',
-    command: operationText !== '' ? operationText : fileAccessOperation(context),
+    command: resolveOperationText(context),
     paths: context.paths ?? [],
     workdir: context.workdir ?? '',
     reason: context.reason ?? null,
@@ -149,8 +137,11 @@ function mapProbeError(errorClass) {
   }
 }
 
-function probeMessage(errorClass, detail) {
-  const base =
+// Fixed, class-specific messages. Raw transport exception text (which may
+// carry URLs, credentials or response bodies) is never surfaced — the status
+// class alone is what an operator needs to act on.
+function probeMessage(statusClass) {
+  return (
     {
       unreachable: 'The decision backend could not be reached.',
       timeout: 'The decision backend did not respond in time.',
@@ -158,10 +149,8 @@ function probeMessage(errorClass, detail) {
       auth: 'Authentication failed — check the provider credential.',
       provider_missing: 'The selected provider is missing or has no credential.',
       error: 'The connection test failed.',
-    }[errorClass] ?? 'The connection test failed.'
-  // Only transport/network details are surfaced; never a response body or key.
-  if ((errorClass === 'unreachable' || errorClass === 'error') && detail) return `${base} (${detail})`
-  return base
+    }[statusClass] ?? 'The connection test failed.'
+  )
 }
 
 /**
@@ -247,7 +236,7 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
    */
   async function evaluate(context) {
     const config = readConfig(getSettings() ?? {})
-    const operationText = context.command || context.description || fileAccessOperation(context) || context.tool || ''
+    const operationText = resolveOperationText(context) || context.tool || ''
 
     if (!config.enabled) return { action: 'ask', reason: 'Smart approvals disabled.', meta: { decision: 'ESCALATE', ruleId: 'disabled', humanApprovalRequired: true } }
 
@@ -415,8 +404,8 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
     let transport
     try {
       transport = transportFor(providerAccess, provider, config)
-    } catch (error) {
-      return { ok: false, statusClass: 'error', message: error instanceof Error ? error.message : String(error), latencyMs: null }
+    } catch {
+      return { ok: false, statusClass: 'error', message: probeMessage('error'), latencyMs: null }
     }
     const result = await decide({
       transport,
@@ -429,7 +418,7 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
       return { ok: true, statusClass: 'success', message: 'Backend responded with a valid System One schema.', latencyMs: result.latencyMs }
     }
     const statusClass = mapProbeError(result.errorClass)
-    return { ok: false, statusClass, message: probeMessage(statusClass, result.error), latencyMs: result.latencyMs }
+    return { ok: false, statusClass, message: probeMessage(statusClass), latencyMs: result.latencyMs }
   }
 
   return { evaluate, testConnection, questions: QUESTIONS, defaultModel: CLIENT_DEFAULT_MODEL }

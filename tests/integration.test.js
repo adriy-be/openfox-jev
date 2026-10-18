@@ -749,6 +749,32 @@ describe('connection probe — genuine connectivity/protocol test', () => {
     assert.ok(!/sk-|Bearer|credential value/i.test(out.statusText.en))
   })
 
+  it('probe errors never leak credentials, tokens or URLs from raw transport exceptions', async () => {
+    const access = providerAccessStub([OPENROUTER], async () => {
+      throw new Error('fetch failed: https://admin:Sup3rS3cret@internal.corp/api?api_key=sk-abcdef1234567890 Authorization: Bearer ghp_abcdefghij12345')
+    })
+    const registered = makeRegistry({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true }, access)
+    const out = await registered.rpc.get('testConnection')()
+    assert.equal(out.running, false)
+    const text = out.statusText.en
+    assert.ok(!text.includes('Sup3rS3cret'), 'URL-embedded credential must not leak')
+    assert.ok(!text.includes('internal.corp'), 'URL host must not leak')
+    assert.ok(!text.includes('sk-abcdef1234567890'), 'API key must not leak')
+    assert.ok(!text.includes('ghp_abcdefghij12345'), 'Bearer token must not leak')
+  })
+
+  it('an unclassified transport error carrying a sensitive payload leaks nothing', async () => {
+    const access = providerAccessStub([OPENROUTER], async () => {
+      throw new Error('unexpected: session token=deadbeefcafebabe1234 exposed in response body')
+    })
+    const registered = makeRegistry({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true }, access)
+    const out = await registered.rpc.get('testConnection')()
+    assert.equal(out.running, false)
+    assert.equal(out.statusTone, 'danger')
+    assert.ok(!out.statusText.en.includes('deadbeefcafebabe1234'), 'sensitive payload must not leak')
+    assert.ok(!out.statusText.en.includes('unexpected:'), 'raw exception text must not leak')
+  })
+
   it('a disabled plugin reports disabled without probing', async () => {
     const access = providerAccessStub([OPENROUTER], async () => {
       throw new Error('should not be called')

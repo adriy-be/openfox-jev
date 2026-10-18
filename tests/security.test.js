@@ -315,3 +315,92 @@ describe('secure project path containment', () => {
     assert.equal(writeOp('/tmp-evil/x.txt').decision, 'ESCALATE')
   })
 })
+
+describe('symlink escape containment (real filesystem)', () => {
+  function workdirFixture() {
+    const dir = mkdtempSync(join(tmpdir(), 'jev-sym-'))
+    const work = join(dir, 'work')
+    mkdirSync(work)
+    return { dir, work }
+  }
+
+  it('rejects a symlink followed by .. that escapes the workdir', () => {
+    const { dir, work } = workdirFixture()
+    try {
+      symlinkSync('/etc', join(work, 'link'))
+      // String concat keeps the raw `..` intact: the OS resolves the symlink
+      // before the .., landing in / — outside the workdir.
+      const escaped = `${work}/link/../secret.txt`
+      const r = evaluateSecurity({ tool: 'write_file', paths: [escaped], workdir: work })
+      assert.equal(r.decision, 'ESCALATE')
+      assert.equal(r.ruleId, 'write_outside_project')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a non-existing target under a symlinked parent that points outside', () => {
+    const { dir, work } = workdirFixture()
+    try {
+      symlinkSync('/etc', join(work, 'link'))
+      const r = evaluateSecurity({ tool: 'write_file', paths: [`${work}/link/brand-new.txt`], workdir: work })
+      assert.equal(r.decision, 'ESCALATE')
+      assert.equal(r.ruleId, 'write_outside_project')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('still allows writes inside a symlinked workdir, but not through an inner escaping symlink', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jev-sym-'))
+    try {
+      const real = join(dir, 'realwork')
+      const linkwork = join(dir, 'worklink')
+      mkdirSync(real)
+      symlinkSync(real, linkwork)
+      assert.equal(evaluateSecurity({ tool: 'write_file', paths: [join(linkwork, 'src', 'a.js')], workdir: linkwork }).decision, null)
+      assert.equal(evaluateSecurity({ tool: 'write_file', paths: ['src/a.js'], workdir: linkwork }).decision, null)
+      symlinkSync('/etc', join(linkwork, 'link'))
+      const escaped = evaluateSecurity({ tool: 'write_file', paths: [`${linkwork}/link/shadow`], workdir: linkwork })
+      assert.equal(escaped.decision, 'ESCALATE')
+      assert.equal(escaped.ruleId, 'write_outside_project')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('allows a legitimate relative and absolute write that stays inside the project', () => {
+    const { dir, work } = workdirFixture()
+    try {
+      assert.equal(evaluateSecurity({ tool: 'write_file', paths: ['src/ok.js'], workdir: work }).decision, null)
+      assert.equal(evaluateSecurity({ tool: 'write_file', paths: [join(work, 'src', 'ok.js')], workdir: work }).decision, null)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('canonical operation text (rules and model judge the same text)', () => {
+  it('an empty command with a dangerous description is judged from the description', () => {
+    const r = evaluateSecurity({ tool: 'run_command', command: '', description: 'rm -rf /' })
+    assert.equal(r.decision, 'DENY')
+    assert.equal(r.ruleId, 'wipe_home_or_root')
+  })
+
+  it('a whitespace-only command with a dangerous description cannot bypass the rules', () => {
+    const r = evaluateSecurity({ tool: 'run_command', command: '   ', description: 'rm -rf /' })
+    assert.equal(r.decision, 'DENY')
+    assert.equal(r.ruleId, 'wipe_home_or_root')
+  })
+
+  it('a valid command always takes priority over the description', () => {
+    const r = evaluateSecurity({ tool: 'run_command', command: 'git status', description: 'rm -rf /' })
+    assert.equal(r.decision, null, 'the benign command — not the description — is what the rules judge')
+  })
+
+  it('with neither command nor description, the synthesized file access text is judged', () => {
+    const r = evaluateSecurity({ tool: 'read_file', paths: ['/home/u/.ssh/id_rsa'] })
+    assert.equal(r.decision, 'DENY')
+    assert.equal(r.ruleId, 'private_key_access')
+  })
+})
