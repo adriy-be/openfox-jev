@@ -1,3 +1,5 @@
+import { homedir } from 'node:os'
+
 const SECRET_PATTERNS = [
   // Bearer/API-style tokens
   /\b(?:sk|pk|rk|ghp|gho|ghu|ghs|ghr|xox[baprs])[-_][A-Za-z0-9._-]{8,}/g,
@@ -114,6 +116,37 @@ const HARD_DENY = [
     decision: 'DENY',
   },
   {
+    id: 'secret_folder_access',
+    reason: 'Access to secret key directories or shadow password files is prohibited.',
+    test: (op) =>
+      (op.paths ?? []).some((p) => {
+        const normalized = (p ?? '').replace(/\/+$/, '')
+        return (
+          /(^|\/)\.ssh(\/|$)/.test(normalized) ||
+          /(^|\/)\.gnupg(\/|$)/.test(normalized) ||
+          normalized === '/etc/shadow' ||
+          normalized === '/etc/gshadow'
+        )
+      }),
+    decision: 'DENY',
+  },
+  {
+    id: 'sensitive_file_access',
+    reason: 'Access to files that may contain secrets requires human confirmation.',
+    test: (op) => op.reason === 'sensitive_file' || op.reason === 'both',
+    decision: 'ESCALATE',
+  },
+  {
+    id: 'home_or_root_access',
+    reason: 'Access to the home directory or the filesystem root is too broad for automatic approval.',
+    test: (op) =>
+      (op.paths ?? []).some((p) => {
+        const normalized = (p ?? '').replace(/\/+$/, '')
+        return p === '/' || normalized === homedir()
+      }),
+    decision: 'ESCALATE',
+  },
+  {
     id: 'git_no_verify',
     reason: 'Bypassing git hooks (--no-verify) requires explicit human confirmation.',
     test: (op) => /\bgit\b[^\n|;&]*\s--no-verify\b/.test(op.command ?? ''),
@@ -173,6 +206,7 @@ export function evaluateSecurity(operation) {
     command: operation?.command ?? operation?.description ?? '',
     paths: Array.isArray(operation?.paths) ? operation.paths : [],
     workdir: operation?.workdir ?? '',
+    reason: operation?.reason ?? null,
   }
   for (const rule of HARD_DENY) {
     if (rule.test(op)) return { decision: rule.decision, ruleId: rule.id, reason: rule.reason }

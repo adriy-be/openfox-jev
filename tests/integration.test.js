@@ -1,8 +1,8 @@
 import { describe, it, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
+import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
 import { register } from '../src/index.js'
 import { createAuditLog } from '../src/audit.js'
@@ -496,5 +496,146 @@ describe('local Jev-Style backend cancellation over real loopback HTTP', () => {
     assert.equal(result.action, 'ask', 'a cancelled local operation must never be allowed')
     assert.equal(result.meta.errorClass, 'cancelled')
     assert.equal(result.meta.humanApprovalRequired, true)
+  })
+})
+
+describe('File Access (folder access) end-to-end', () => {
+  const FOLDER_ACCESS = { kind: 'path', tool: 'read_file', paths: ['/srv/git/other-project'], workdir: '/w', reason: 'outside_workdir', sessionId: 's1' }
+
+  it('shadow mode asks for folder access even when the model approves', async () => {
+    let calls = 0
+    const registered = makeRegistry(
+      { enabled: true, mode: 'shadow', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Reading other projects is allowed.' },
+      providerAccessStub([OPENROUTER], async () => {
+        calls += 1
+        return jevAnswer('APPROVE')
+      }),
+    )
+    const result = await registered.reviewers[0].evaluate(FOLDER_ACCESS)
+    assert.equal(result.action, 'ask')
+    assert.ok(result.meta.outcome.startsWith('shadow_'))
+    assert.equal(calls, 1)
+  })
+
+  it('enforce mode approves a non-sensitive outside-workdir read, one-time only', async () => {
+    let calls = 0
+    const registered = makeRegistry(
+      { enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Reading other projects is allowed.' },
+      providerAccessStub([OPENROUTER], async () => {
+        calls += 1
+        return jevAnswer('APPROVE')
+      }),
+    )
+    const first = await registered.reviewers[0].evaluate(FOLDER_ACCESS)
+    const second = await registered.reviewers[0].evaluate(FOLDER_ACCESS)
+    assert.equal(first.action, 'allow')
+    assert.equal(second.action, 'allow')
+    assert.equal(calls, 2, 'folder access is never remembered between evaluations')
+  })
+
+  it('denies .ssh folder access without contacting the backend', async () => {
+    let calls = 0
+    const registered = makeRegistry(
+      { enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Everything is allowed.' },
+      providerAccessStub([OPENROUTER], async () => {
+        calls += 1
+        return jevAnswer('APPROVE')
+      }),
+    )
+    const result = await registered.reviewers[0].evaluate({ ...FOLDER_ACCESS, paths: ['/home/u/.ssh'] })
+    assert.equal(result.action, 'deny')
+    assert.equal(result.meta.ruleId, 'secret_folder_access')
+    assert.equal(calls, 0)
+  })
+
+  it('escalates sensitive file access without contacting the backend', async () => {
+    let calls = 0
+    const registered = makeRegistry(
+      { enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Everything is allowed.' },
+      providerAccessStub([OPENROUTER], async () => {
+        calls += 1
+        return jevAnswer('APPROVE')
+      }),
+    )
+    const result = await registered.reviewers[0].evaluate({ ...FOLDER_ACCESS, workdir: '/w', paths: ['/w/.env'], reason: 'sensitive_file' })
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.ruleId, 'sensitive_file_access')
+    assert.equal(calls, 0)
+  })
+
+  it('escalates home directory access without contacting the backend', async () => {
+    let calls = 0
+    const registered = makeRegistry(
+      { enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Everything is allowed.' },
+      providerAccessStub([OPENROUTER], async () => {
+        calls += 1
+        return jevAnswer('APPROVE')
+      }),
+    )
+    const result = await registered.reviewers[0].evaluate({ ...FOLDER_ACCESS, paths: [homedir()] })
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.ruleId, 'home_or_root_access')
+    assert.equal(calls, 0)
+  })
+
+  it('audit records the file_access category for folder access', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jev-fa-audit-'))
+    try {
+      const audit = createAuditLog({ filePath: join(dir, 'd.jsonl') })
+      const { createReviewer } = await import('../src/reviewer.js')
+      const reviewer = createReviewer({
+        getSettings: () => ({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Reading other projects is allowed.' }),
+        providerAccess: providerAccessStub([OPENROUTER], async () => jevAnswer('APPROVE')),
+        audit,
+      })
+      await reviewer.evaluate(FOLDER_ACCESS)
+      const rows = readFileSync(join(dir, 'd.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+      assert.equal(rows.length, 1)
+      assert.equal(rows[0].operationCategory, 'file_access')
+      assert.ok(rows[0].operationRedacted.includes('File access request'))
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('local loopback backend receives the synthesized file access operation', async () => {
+    const received = []
+    const server = createServer((req, res) => {
+      let body = ''
+      req.on('data', (chunk) => {
+        body += chunk
+      })
+      req.on('end', () => {
+        if (req.url === '/v1/systemone' && req.method === 'POST') {
+          received.push(JSON.parse(body))
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(jevAnswer('APPROVE')))
+          return
+        }
+        res.writeHead(404)
+        res.end()
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const port = server.address().port
+      const registered = makeRegistry(
+        {
+          enabled: true,
+          mode: 'enforce',
+          providerId: '',
+          backendKind: 'local',
+          localUrl: `http://127.0.0.1:${port}`,
+          operatorPolicy: 'Reading other projects is allowed.',
+        },
+        undefined,
+      )
+      const result = await registered.reviewers[0].evaluate(FOLDER_ACCESS)
+      assert.equal(result.action, 'allow')
+      assert.equal(received.length, 1)
+      assert.ok(received[0].state.includes('File access request: read_file wants read access to /srv/git/other-project'))
+    } finally {
+      server.close()
+    }
   })
 })

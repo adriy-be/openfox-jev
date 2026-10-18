@@ -56,16 +56,34 @@ export function readConfig(settings = {}) {
  * Tool arguments and repository content are untrusted data; the operator
  * policy is trusted and clearly separated.
  */
+const WRITE_TOOLS = new Set(['write_file', 'edit_file'])
+
+// Judging an empty operation is unreliable; pure File Access requests get an explicit description.
+export function fileAccessOperation(context) {
+  const paths = Array.isArray(context?.paths) ? context.paths.filter(Boolean) : []
+  if (paths.length === 0) return ''
+  const access = WRITE_TOOLS.has(context?.tool) ? 'write' : 'read'
+  const reason = context?.reason ? ` — reason: ${context.reason}` : ''
+  return `File access request: ${context?.tool ?? 'unknown tool'} wants ${access} access to ${paths.join(', ')}${reason}`
+}
+
 export function buildState(context, config) {
+  const hasOperationText = Boolean(context.command) || Boolean(context.description)
   return {
     tool: context.tool ?? '',
     kind: context.kind ?? 'path',
-    command: context.command ?? context.description ?? '',
+    command: hasOperationText ? context.command ?? context.description ?? '' : fileAccessOperation(context),
     paths: context.paths ?? [],
     workdir: context.workdir ?? '',
     reason: context.reason ?? null,
     policy: config.operatorPolicy || 'No operator policy configured: prefer escalation for anything non-routine.',
   }
+}
+
+function operationCategoryFor(context) {
+  const purePath = context.kind === 'path' && !context.command && !context.description && (context.paths ?? []).length > 0
+  if (purePath) return 'file_access'
+  return OPERATION_CATEGORIES[context.tool] ?? 'other'
 }
 
 function transportFor(providerAccess, provider, config) {
@@ -163,7 +181,7 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
         mode: config.mode,
         providerId: provider?.id ?? null,
         model: meta.model ?? null,
-        operationCategory: OPERATION_CATEGORIES[context.tool] ?? 'other',
+        operationCategory: operationCategoryFor(context),
         operation: operationText,
         rawVerdict: meta.modelVerdict ?? null,
         decision: meta.decision ?? null,
@@ -189,7 +207,7 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
    */
   async function evaluate(context) {
     const config = readConfig(getSettings() ?? {})
-    const operationText = context.command || context.description || (context.paths ?? []).join(' ') || context.tool || ''
+    const operationText = context.command || context.description || fileAccessOperation(context) || context.tool || ''
 
     if (!config.enabled) return { action: 'ask', reason: 'Smart approvals disabled.', meta: { decision: 'ESCALATE', ruleId: 'disabled', humanApprovalRequired: true } }
 

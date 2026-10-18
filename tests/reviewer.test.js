@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, readFileSync, existsSync, statSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
 import { createReviewer, readConfig, buildState } from '../src/reviewer.js'
 import { createAuditLog } from '../src/audit.js'
@@ -408,5 +408,100 @@ describe('audit logging', () => {
     assert.ok(existsSync(path))
     assert.ok(existsSync(`${path}.1`))
     assert.ok(statSync(path).size < 2000)
+  })
+})
+
+describe('file access requests (kind path, no command)', () => {
+  const FILE_ACCESS = { kind: 'path', tool: 'read_file', paths: ['/srv/data/reference.json'], workdir: '/w', reason: 'outside_workdir', sessionId: 's1' }
+
+  it('buildState synthesizes the operation for pure path requests', () => {
+    const state = buildState(FILE_ACCESS, { operatorPolicy: 'x' })
+    assert.equal(state.command, 'File access request: read_file wants read access to /srv/data/reference.json — reason: outside_workdir')
+    assert.equal(state.reason, 'outside_workdir')
+    assert.deepEqual(state.paths, ['/srv/data/reference.json'])
+  })
+
+  it('buildState derives write access from write tools', () => {
+    const state = buildState({ kind: 'path', tool: 'write_file', paths: ['/srv/data/out.json'], workdir: '/w', reason: 'outside_workdir' }, { operatorPolicy: 'x' })
+    assert.match(state.command, /write access to \/srv\/data\/out\.json/)
+  })
+
+  it('buildState keeps a real command untouched', () => {
+    const state = buildState(
+      { kind: 'path', tool: 'run_command', command: 'cat /etc/hostname', paths: ['/etc/hostname'], workdir: '/w', reason: 'outside_workdir' },
+      { operatorPolicy: 'x' },
+    )
+    assert.equal(state.command, 'cat /etc/hostname')
+  })
+
+  it('sends the synthesized operation to the backend and can approve it', async () => {
+    let body
+    const access = makeProviderAccess([OPENROUTER], async (_id, _key, sent) => {
+      body = sent
+      return validResponse()
+    })
+    const reviewer = makeReviewer(
+      { enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Reading reference data outside the project is allowed.' },
+      access,
+    )
+    const result = await reviewer.evaluate(FILE_ACCESS)
+    assert.equal(result.action, 'allow')
+    const sentState = JSON.parse(body.state)
+    assert.equal(sentState.command, 'File access request: read_file wants read access to /srv/data/reference.json — reason: outside_workdir')
+  })
+
+  it('escalates sensitive file reasons without contacting the backend', async () => {
+    let called = 0
+    const access = makeProviderAccess([OPENROUTER], async () => {
+      called += 1
+      return validResponse()
+    })
+    const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'x' }, access)
+    const result = await reviewer.evaluate({ kind: 'path', tool: 'read_file', paths: ['/w/.env'], workdir: '/w', reason: 'sensitive_file', sessionId: 's1' })
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.ruleId, 'sensitive_file_access')
+    assert.equal(called, 0)
+  })
+
+  it('denies .ssh folder access without contacting the backend', async () => {
+    let called = 0
+    const access = makeProviderAccess([OPENROUTER], async () => {
+      called += 1
+      return validResponse()
+    })
+    const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Everything is allowed.' }, access)
+    const result = await reviewer.evaluate({ kind: 'path', tool: 'read_file', paths: ['/home/u/.ssh'], workdir: '/w', reason: 'outside_workdir', sessionId: 's1' })
+    assert.equal(result.action, 'deny')
+    assert.equal(result.meta.ruleId, 'secret_folder_access')
+    assert.equal(called, 0)
+  })
+
+  it('escalates home directory access without contacting the backend', async () => {
+    let called = 0
+    const access = makeProviderAccess([OPENROUTER], async () => {
+      called += 1
+      return validResponse()
+    })
+    const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Everything is allowed.' }, access)
+    const result = await reviewer.evaluate({ kind: 'path', tool: 'read_file', paths: [homedir()], workdir: '/w', reason: 'outside_workdir', sessionId: 's1' })
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.ruleId, 'home_or_root_access')
+    assert.equal(called, 0)
+  })
+
+  it('shadow mode always asks for file access and records the prediction', async () => {
+    const reviewer = makeReviewer({ enabled: true, mode: 'shadow', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'x' })
+    const result = await reviewer.evaluate(FILE_ACCESS)
+    assert.equal(result.action, 'ask')
+    assert.ok(result.meta.outcome.startsWith('shadow_'))
+    assert.equal(result.meta.humanApprovalRequired, true)
+  })
+
+  it('audit records the file_access category with the synthesized operation', async () => {
+    const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Reading reference data outside the project is allowed.' })
+    await reviewer.evaluate(FILE_ACCESS)
+    const row = JSON.parse(readFileSync(join(auditDir, 'decisions.jsonl'), 'utf8').trim().split('\n')[0])
+    assert.equal(row.operationCategory, 'file_access')
+    assert.ok(row.operationRedacted.includes('File access request: read_file wants read access to /srv/data/reference.json'))
   })
 })

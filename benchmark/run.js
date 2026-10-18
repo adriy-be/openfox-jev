@@ -35,6 +35,7 @@ import { resolve } from 'node:path'
 import { decide, QUESTIONS, truncateState } from '../src/client.js'
 import { applyPolicy, DEFAULT_THRESHOLDS } from '../src/policy.js'
 import { evaluateSecurity, redactState } from '../src/security.js'
+import { buildState } from '../src/reviewer.js'
 
 const args = parseArgs(process.argv.slice(2))
 
@@ -142,15 +143,17 @@ async function runBackend(name, corpus, { hasPolicy = true } = {}) {
 
   for (const sample of corpus) {
     const started = Date.now()
-    const state = {
-      tool: sample.tool ?? 'run_command',
-      kind: 'path',
-      command: sample.command,
-      paths: sample.paths ?? [],
-      workdir: sample.workdir ?? '/workspace/project',
-      reason: sample.reason ?? null,
-      policy: sample.policy ?? 'Routine read-only git commands are allowed.',
-    }
+    const state = buildState(
+      {
+        kind: 'path',
+        tool: sample.tool ?? 'run_command',
+        command: sample.command,
+        paths: sample.paths ?? [],
+        workdir: sample.workdir ?? '/workspace/project',
+        reason: sample.reason ?? null,
+      },
+      { operatorPolicy: sample.policy ?? 'Routine read-only git commands are allowed.' },
+    )
     const { state: safeState } = redactState(state)
 
     const result = await decide({
@@ -170,7 +173,7 @@ async function runBackend(name, corpus, { hasPolicy = true } = {}) {
       continue
     }
 
-    const security = evaluateSecurity({ tool: sample.tool, command: sample.command, paths: sample.paths })
+    const security = evaluateSecurity({ tool: sample.tool, command: sample.command, paths: sample.paths, reason: sample.reason ?? null })
     const policy = applyPolicy(
       result.answers,
       {

@@ -17,12 +17,17 @@ provider ID and approval-specific settings.
 ## How a decision is made
 
 ```
-confirmation request (before tool execution)
+confirmation request (before tool execution) — tool commands **and**
+File Access / folder-access dialogs
   → 1. OpenFox mandatory rules (git --no-verify, dangerous patterns,
         sensitive paths, workdir confinement, sub-agent/night-mode) — unchanged
   → 2. Plugin deterministic hard rules (destructive, secrets, exfil,
-        privilege escalation, force-push, injection, truncation)
-  → 3. Sanitized operation → typed System One questions (choice/noul/score)
+        privilege escalation, force-push, injection, truncation,
+        secret folders, sensitive files, home/root access)
+  → 3. Sanitized operation → typed System One questions (choice/noul/score).
+        File Access requests carry no command, so the plugin synthesizes an
+        explicit operation ("File access request: <tool> wants read/write
+        access to <paths>") for the model to judge
   → 4. Strict response validation (probabilities, confidence, legend bounds)
   → 5. Deterministic policy → APPROVE | ESCALATE | DENY
   → 6. Shadow mode? record prediction only, keep native approval
@@ -102,6 +107,10 @@ to collect real approval cases before switching to enforce.
   responses escalate, never approve.
 - Truncated operations are never auto-approved; operations are never approved
   on agent-supplied claims of safety.
+- File Access (folder/path) requests are reviewed too: access to secret key
+  folders (`.ssh`, `.gnupg`) and shadow password files is **denied**,
+  upstream-sensitive files and home/root access are **escalated**, and every
+  other folder request goes through the same model + policy gate.
 - Reviewer absence, errors or timeouts fall back to the native confirmation
   flow (fail-closed). Disabling the plugin restores stock OpenFox behavior.
 - Audit logging failures never change a decision.
@@ -111,7 +120,7 @@ to collect real approval cases before switching to enforce.
 ## Tests
 
 ```bash
-npm test        # node:test — 144 tests: providers, client, policy,
+npm test        # node:test — 170 tests: providers, client, policy,
                 # security, reviewer, integration (real loopback server)
 ```
 
@@ -140,9 +149,9 @@ differences because every route runs the identical question set.
 
 - Requires the upstream OpenFox extension (PR #439); on stock OpenFox the
   plugin loads but cannot review confirmations.
-- Only eligible confirmation paths are reviewed (path/command gates and git/
-  workspace confirmations). `ask_user` and night-mode/sub-agent flows are
-  untouched by design.
+- Only eligible confirmation paths are reviewed: path/command gates,
+  **File Access / folder-access dialogs**, and git/workspace confirmations.
+  `ask_user` and night-mode/sub-agent flows are untouched by design.
 - Local Jev servers ignore the `model` field — 0.8B vs 2B is a server-side
   choice, benchmarked via the `jev-0.8b` / `jev-2b` backends (separate URLs).
 - Thresholds are conservative defaults; tune with labelled data

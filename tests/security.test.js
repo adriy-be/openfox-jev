@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { homedir } from 'node:os'
 import { redactSecrets, redactState, evaluateSecurity, hashId } from '../src/security.js'
 
 describe('secret redaction', () => {
@@ -148,5 +149,78 @@ describe('mandatory security rules', () => {
 
   it('does not flag --no-verify outside git', () => {
     assert.equal(evaluateSecurity({ command: 'grep --no-verify foo bar' }).decision, null)
+  })
+})
+
+describe('file access security rules', () => {
+  it('denies access to the .ssh folder', () => {
+    const r = evaluateSecurity({ tool: 'read_file', paths: ['/home/u/.ssh'], workdir: '/w', reason: 'outside_workdir' })
+    assert.equal(r.decision, 'DENY')
+    assert.equal(r.ruleId, 'secret_folder_access')
+  })
+
+  it('denies access to files inside the .ssh folder', () => {
+    const r = evaluateSecurity({ tool: 'read_file', paths: ['/home/u/.ssh/known_hosts'], workdir: '/w', reason: 'outside_workdir' })
+    assert.equal(r.decision, 'DENY')
+    assert.equal(r.ruleId, 'secret_folder_access')
+  })
+
+  it('denies access to the .gnupg folder', () => {
+    const r = evaluateSecurity({ tool: 'read_file', paths: ['/root/.gnupg'], workdir: '/w', reason: 'outside_workdir' })
+    assert.equal(r.decision, 'DENY')
+    assert.equal(r.ruleId, 'secret_folder_access')
+  })
+
+  it('denies access to shadow password files', () => {
+    const r = evaluateSecurity({ tool: 'read_file', paths: ['/etc/shadow'], workdir: '/w', reason: 'outside_workdir' })
+    assert.equal(r.decision, 'DENY')
+    assert.equal(r.ruleId, 'secret_folder_access')
+    assert.equal(
+      evaluateSecurity({ tool: 'read_file', paths: ['/etc/gshadow'], workdir: '/w', reason: 'outside_workdir' }).ruleId,
+      'secret_folder_access',
+    )
+  })
+
+  it('does not deny unrelated paths that merely resemble the patterns', () => {
+    assert.equal(
+      evaluateSecurity({ tool: 'read_file', paths: ['/srv/data/ssh-config-notes.md'], workdir: '/w', reason: 'outside_workdir' }).decision,
+      null,
+    )
+    assert.equal(evaluateSecurity({ tool: 'read_file', paths: ['/etc/shadowcopy'], workdir: '/w', reason: 'outside_workdir' }).decision, null)
+  })
+
+  it('escalates upstream sensitive-file reasons before the model', () => {
+    const r = evaluateSecurity({ tool: 'read_file', paths: ['/w/.env'], workdir: '/w', reason: 'sensitive_file' })
+    assert.equal(r.decision, 'ESCALATE')
+    assert.equal(r.ruleId, 'sensitive_file_access')
+    assert.equal(
+      evaluateSecurity({ tool: 'write_file', paths: ['/etc/hosts', '/w/.env'], workdir: '/w', reason: 'both' }).ruleId,
+      'sensitive_file_access',
+    )
+  })
+
+  it('escalates file access to the home directory', () => {
+    const r = evaluateSecurity({ tool: 'read_file', paths: [homedir()], workdir: '/w', reason: 'outside_workdir' })
+    assert.equal(r.decision, 'ESCALATE')
+    assert.equal(r.ruleId, 'home_or_root_access')
+  })
+
+  it('escalates file access to the filesystem root', () => {
+    const r = evaluateSecurity({ tool: 'read_file', paths: ['/'], workdir: '/w', reason: 'outside_workdir' })
+    assert.equal(r.decision, 'ESCALATE')
+    assert.equal(r.ruleId, 'home_or_root_access')
+  })
+
+  it('hard deny still wins over the sensitive-file reason', () => {
+    const r = evaluateSecurity({ tool: 'read_file', paths: ['/home/u/.ssh/id_rsa'], workdir: '/w', reason: 'both' })
+    assert.equal(r.decision, 'DENY')
+    assert.equal(r.ruleId, 'private_key_access')
+  })
+
+  it('command confirmations are unaffected by the new path rules', () => {
+    assert.equal(
+      evaluateSecurity({ tool: 'run_command', command: 'git status', workdir: '/w', reason: 'dangerous_command' }).decision,
+      null,
+    )
   })
 })
