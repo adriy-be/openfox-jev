@@ -86,8 +86,10 @@ never triggers a GPU workload.
 **Privacy**
 - *Permit sending approval data to a cloud provider* — explicit opt-in,
   **required even in shadow mode** for OpenRouter/DeepInfra. Local Jev never
-  needs it. Secrets are redacted before egress; escalation occurs when
-  redaction removes decision-critical context.
+  needs it. Recognized credential patterns (bearer tokens, API keys, private
+  key blocks, JWTs, `key=value` pairs, embedded URL credentials) are redacted
+  before egress; escalation occurs when redaction removes decision-critical
+  context. Redaction is pattern-based and best-effort — see *Limitations*.
 
 ## Shadow mode
 
@@ -120,7 +122,7 @@ to collect real approval cases before switching to enforce.
 ## Tests
 
 ```bash
-npm test        # node:test — 170 tests: providers, client, policy,
+npm test        # node:test — 216 tests: providers, client, policy,
                 # security, reviewer, integration (real loopback server)
 ```
 
@@ -158,6 +160,14 @@ differences because every route runs the identical question set.
   (`benchmark/run.js`).
 - Cloud cost estimates use configurable per-token prices — verify against
   current provider pricing.
+- Secret redaction is **pattern-based and best-effort**. It recognizes a
+  fixed set of credential shapes (bearer tokens, `sk-`/`ghp_`-style API keys,
+  AWS keys, private key blocks, JWTs, `key=value` pairs, embedded URL
+  credentials). A secret that matches none of these patterns is **not
+  guaranteed to be detected** and may still egress. The
+  `redaction_incomplete` escalation is a safety net that fires when a pattern
+  *did* match and decision-critical context was removed — it is not a
+  guarantee that every secret is caught.
 
 ## License
 

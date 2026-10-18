@@ -36,6 +36,28 @@ describe('secret redaction', () => {
     assert.equal(text, 'git status')
   })
 
+  it('redacts secrets embedded in file paths', () => {
+    const { text, redacted } = redactSecrets('cp /home/u/.config/tokens/sk-abcdef1234567890.json /w/')
+    assert.equal(redacted, true)
+    assert.ok(!text.includes('sk-abcdef1234567890'))
+    assert.ok(text.includes('[REDACTED]'))
+  })
+
+  it('redacts secrets in the description and paths fields of a state object', () => {
+    const { state, redacted } = redactState({
+      tool: 'read_file',
+      command: '',
+      description: 'Read the password=hunter2secretfile config',
+      paths: ['/home/u/creds/pk-abcdef1234567890.json'],
+    })
+    assert.equal(redacted, true)
+    const dump = JSON.stringify(state)
+    assert.ok(!dump.includes('hunter2secretfile'))
+    assert.ok(!dump.includes('pk-abcdef1234567890'))
+    assert.ok(state.description.includes('[REDACTED]'))
+    assert.ok(state.paths[0].includes('[REDACTED]'))
+  })
+
   it('redacts nested state objects', () => {
     const { state, redacted } = redactState({ command: 'curl -H "Bearer sk-abcdefghijkl" x', nested: { token: 'ghp_abcdefghij12345' } })
     assert.equal(redacted, true)
