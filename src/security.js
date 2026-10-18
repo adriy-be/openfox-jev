@@ -1,4 +1,6 @@
 import { homedir } from 'node:os'
+import { realpathSync } from 'node:fs'
+import { posix } from 'node:path'
 
 const SECRET_PATTERNS = [
   // Bearer/API-style tokens
@@ -67,6 +69,62 @@ export function hashId(text) {
     h1 = Math.imul(h1, 0x01000193)
   }
   return (h1 >>> 0).toString(16).padStart(8, '0')
+}
+
+/**
+ * Textual path normalization for containment checks. Unifies separators,
+ * resolves `.`/`..` segments, and resolves relative paths against `base`.
+ * Handles both POSIX and Windows (drive-letter) paths as plain text.
+ */
+export function normalizePathText(p, base) {
+  if (typeof p !== 'string' || p.length === 0) return ''
+  let s = p.replace(/\\/g, '/')
+  const drive = /^[a-zA-Z]:/.test(s) ? s.slice(0, 2) : ''
+  if (drive) s = s.slice(2)
+  const rooted = s.startsWith('/')
+  if (!rooted) {
+    const b = base ? base.replace(/\\/g, '/').replace(/^[a-zA-Z]:/, '') : ''
+    s = (b.startsWith('/') ? b : '/' + b) + '/' + s
+  }
+  const norm = posix.normalize(s)
+  return drive ? drive + norm : norm
+}
+
+function tryRealpath(p) {
+  try {
+    return realpathSync(p).replace(/\\/g, '/')
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Whether `candidate` is contained within `workdir`. Conservative and
+ * fail-closed: an empty/ambiguous workdir, a textual escape, or a symlink that
+ * resolves outside the workdir all count as NOT contained (→ escalate).
+ * Existing targets (and existing ancestors of a non-existing target) are
+ * resolved through their real path to catch symlink escapes.
+ */
+export function isWithinProject(candidate, workdir) {
+  if (!workdir || !candidate) return false
+  const rootNorm = normalizePathText(workdir)
+  const candNorm = normalizePathText(candidate, workdir)
+  if (candNorm !== rootNorm && !candNorm.startsWith(rootNorm + '/')) return false
+  const rootReal = tryRealpath(workdir)
+  if (!rootReal) return true
+  const parts = candNorm.split('/')
+  for (let i = parts.length; i >= 1; i -= 1) {
+    const prefix = parts.slice(0, i).join('/') || '/'
+    const prefixReal = tryRealpath(prefix)
+    if (prefixReal !== null) return prefixReal === rootReal || prefixReal.startsWith(rootReal + '/')
+  }
+  return true
+}
+
+const TMP_EXCEPTIONS = ['/tmp', '/var/tmp']
+
+function isTmpException(path) {
+  return TMP_EXCEPTIONS.some((t) => isWithinProject(path, t))
 }
 
 /**
@@ -176,12 +234,7 @@ const HARD_DENY = [
     test: (op) => {
       if (op.tool !== 'write_file' && op.tool !== 'edit_file') return false
       const workdir = op.workdir ?? ''
-      return (op.paths ?? []).some(
-        (p) =>
-          !p.startsWith('/tmp/') &&
-          !p.startsWith('/var/tmp/') &&
-          (!workdir || !p.startsWith(workdir)),
-      )
+      return (op.paths ?? []).some((p) => !isTmpException(p) && !isWithinProject(p, workdir))
     },
     decision: 'ESCALATE',
   },

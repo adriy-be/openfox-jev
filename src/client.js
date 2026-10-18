@@ -182,6 +182,7 @@ export function classifyError(error) {
     return 'provider_unavailable'
   }
   if (/ENOTFOUND|ECONNREFUSED|ECONNRESET|fetch failed|network|socket/i.test(message)) return 'offline'
+  if (/status 40[13]\b/i.test(message)) return 'auth'
   if (/status [45]\d\d/i.test(message)) return 'http_error'
   if (/invalid JSON|size limit|invalid_response/i.test(message)) return 'invalid_response'
   return 'unknown'

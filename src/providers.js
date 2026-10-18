@@ -75,17 +75,23 @@ export function resolveEndpoint(provider, settings = {}) {
     return { endpointKey: 'decisions', url: parsed.toString() }
   }
 
-  // Cloud providers: match the provider's origin against verified mappings.
+  // Cloud providers: the selected backend kind must match the provider's
+  // verified origin exactly. An explicit openrouter/deepinfra kind is never
+  // silently redirected to a different cloud — credentials would be forwarded
+  // to an unverified origin.
   const origin = safeOrigin(provider?.url)
+  const expectedOrigin = kind === 'openrouter' ? 'https://openrouter.ai' : kind === 'deepinfra' ? 'https://api.deepinfra.com' : null
+  if (kind === 'openrouter' || kind === 'deepinfra') {
+    if (origin !== expectedOrigin) {
+      throw new Error(
+        `Provider URL origin ${origin ?? '(invalid)'} does not match the verified ${kind} origin ${expectedOrigin}. ` +
+          'Update the provider in OpenFox Provider Manager or choose another backend.',
+      )
+    }
+    return { endpointKey: 'decisions', url: null }
+  }
   if (origin && VERIFIED_ORIGINS[origin]) {
     return { endpointKey: VERIFIED_ORIGINS[origin], url: null }
-  }
-  if (kind === 'openrouter' || kind === 'deepinfra') {
-    const expected = kind === 'openrouter' ? 'https://openrouter.ai' : 'https://api.deepinfra.com'
-    throw new Error(
-      `Provider URL origin ${origin ?? '(invalid)'} does not match the verified ${kind} origin ${expected}. ` +
-        'Update the provider in OpenFox Provider Manager or choose another backend.',
-    )
   }
   throw new Error(`No verified endpoint mapping for provider origin ${origin ?? '(invalid)'}`)
 }

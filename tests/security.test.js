@@ -1,6 +1,8 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from 'node:fs'
 import { redactSecrets, redactState, evaluateSecurity, hashId } from '../src/security.js'
 
 describe('secret redaction', () => {
@@ -222,5 +224,72 @@ describe('file access security rules', () => {
       evaluateSecurity({ tool: 'run_command', command: 'git status', workdir: '/w', reason: 'dangerous_command' }).decision,
       null,
     )
+  })
+})
+
+describe('secure project path containment', () => {
+  const WORK = '/workspace/project'
+  const writeOp = (path, workdir = WORK) => evaluateSecurity({ tool: 'write_file', paths: [path], workdir })
+
+  it('escalates a sibling directory that shares the workdir prefix', () => {
+    const r = writeOp('/workspace/project-evil/x.js')
+    assert.equal(r.decision, 'ESCALATE')
+    assert.equal(r.ruleId, 'write_outside_project')
+  })
+
+  it('rejects ../ traversal that lands outside the workdir', () => {
+    assert.equal(writeOp('/workspace/project/../project-evil/x.js').decision, 'ESCALATE')
+  })
+
+  it('rejects deep ../ traversal escaping to /etc', () => {
+    assert.equal(writeOp('/workspace/project/../../etc/passwd').decision, 'ESCALATE')
+  })
+
+  it('allows a relative path that stays inside the workdir', () => {
+    assert.equal(writeOp('src/a.js').decision, null)
+  })
+
+  it('rejects a relative path that escapes the workdir', () => {
+    assert.equal(writeOp('../evil.js').decision, 'ESCALATE')
+  })
+
+  it('allows a non-existing target inside the workdir', () => {
+    assert.equal(writeOp('/workspace/project/new/deep/file.txt').decision, null)
+  })
+
+  it('escalates writes to the filesystem root', () => {
+    assert.equal(writeOp('/').decision, 'ESCALATE')
+  })
+
+  it('escalates writes to the home directory', () => {
+    assert.equal(evaluateSecurity({ tool: 'edit_file', paths: [homedir()], workdir: '/w' }).decision, 'ESCALATE')
+  })
+
+  it('handles Windows-style paths textually', () => {
+    const win = (path, workdir) => evaluateSecurity({ tool: 'write_file', paths: [path], workdir })
+    assert.equal(win('C:/workspace/project/src/a.js', 'C:/workspace/project').decision, null)
+    assert.equal(win('C:/workspace/project-evil/x.js', 'C:/workspace/project').decision, 'ESCALATE')
+    assert.equal(win('C:/workspace/project/../evil.js', 'C:/workspace/project').decision, 'ESCALATE')
+  })
+
+  it('catches a symlink inside the workdir that points outside', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jev-contain-'))
+    try {
+      const work = join(dir, 'work')
+      mkdirSync(work)
+      symlinkSync('/etc', join(work, 'link'))
+      assert.equal(evaluateSecurity({ tool: 'write_file', paths: [join(work, 'ok.txt')], workdir: work }).decision, null)
+      const escaped = evaluateSecurity({ tool: 'write_file', paths: [join(work, 'link', 'passwd')], workdir: work })
+      assert.equal(escaped.decision, 'ESCALATE')
+      assert.equal(escaped.ruleId, 'write_outside_project')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps the /tmp and /var/tmp exceptions narrow (no sibling prefix)', () => {
+    assert.equal(writeOp('/tmp/scratch.txt').decision, null)
+    assert.equal(writeOp('/var/tmp/scratch.txt').decision, null)
+    assert.equal(writeOp('/tmp-evil/x.txt').decision, 'ESCALATE')
   })
 })
