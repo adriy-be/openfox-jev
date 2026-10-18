@@ -1,6 +1,6 @@
 {
   "name": "openfox-jev",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Intelligent tool approval for OpenFox — System One decision models (Jev-Style local, Drex v2.0 via OpenRouter/DeepInfra) with a deterministic approval policy.",
   "type": "module",
   "main": "./src/index.js",
