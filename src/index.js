@@ -279,9 +279,6 @@ export function register(registry) {
     if (!provider && kind !== 'local') {
       return { installed: true, running: false, statusTone: 'danger', statusText: localized('No provider selected', 'Aucun fournisseur sélectionné') }
     }
-    if (provider && !provider.isActive) {
-      return { installed: true, running: false, statusTone: 'danger', statusText: localized('Provider disabled', 'Fournisseur désactivé') }
-    }
     const label = provider?.name ?? 'Local Jev-Style'
     const model = config.model || defaultModelFor(provider, { backendKind: kind })
     let text = `${label} · ${model} · ${config.mode}`

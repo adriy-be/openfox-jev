@@ -285,11 +285,6 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
       record(config, null, context, meta, operationText)
       return { action: 'ask', reason: 'Selected provider is missing or was removed from the Provider Manager.', meta }
     }
-    if (provider && !provider.isActive) {
-      const meta = { decision: 'ESCALATE', ruleId: 'provider_disabled', outcome: 'escalated_provider_disabled', humanApprovalRequired: true, errorClass: 'provider_unavailable' }
-      record(config, provider, context, meta, operationText)
-      return { action: 'ask', reason: 'Selected provider is disabled.', meta }
-    }
     if (provider && isRemoteBackend(provider, { backendKind: config.backendKind || undefined }) && !config.cloudConsent) {
       const meta = { decision: 'ESCALATE', ruleId: 'privacy_consent', outcome: 'escalated_no_consent', humanApprovalRequired: true }
       record(config, provider, context, meta, operationText)
@@ -394,9 +389,6 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
     const kind = config.backendKind || (provider ? detectKind(provider) : 'local')
     if (kind !== 'local' && !provider) {
       return { ok: false, statusClass: 'provider_missing', message: 'No decision provider is selected for this backend.', latencyMs: null }
-    }
-    if (provider && !provider.isActive) {
-      return { ok: false, statusClass: 'provider_missing', message: 'The selected provider is disabled.', latencyMs: null }
     }
     if (isRemoteBackend(provider, { backendKind: config.backendKind || undefined }) && !config.cloudConsent) {
       return { ok: false, statusClass: 'consent_required', message: 'Cloud inference requires privacy consent.', latencyMs: null }

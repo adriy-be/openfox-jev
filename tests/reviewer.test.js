@@ -390,12 +390,20 @@ describe('provider lifecycle', () => {
     assert.equal(result.meta.ruleId, 'provider_unavailable')
   })
 
-  it('escalates when the provider is disabled', async () => {
-    const access = makeProviderAccess([{ ...OPENROUTER, isActive: false }], async () => validResponse())
+  it('ignores provider active state and still consults the backend', async () => {
+    let called = false
+    const access = makeProviderAccess(
+      [{ ...OPENROUTER, isActive: false }],
+      async () => {
+        called = true
+        return validResponse()
+      },
+    )
     const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'x' }, access)
     const result = await reviewer.evaluate(ROUTINE)
-    assert.equal(result.action, 'ask')
-    assert.equal(result.meta.ruleId, 'provider_disabled')
+    assert.equal(called, true, 'backend must be consulted even when the provider is inactive')
+    assert.equal(result.action, 'allow')
+    assert.notEqual(result.meta.ruleId, 'provider_disabled')
   })
 
   it('escalates when cloud consent is missing', async () => {
