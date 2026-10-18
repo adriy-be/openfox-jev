@@ -168,8 +168,11 @@ export function applyPolicy(answers, input = {}, thresholds = {}, context = {}) 
     return result('APPROVE', 'approved', 'Operation is routine, permitted by policy and supported by the model.', modelVerdict, confidence)
   }
 
-  // Rule 9: DENY is reserved for deterministic prohibitions or a sufficiently
-  // supported model-deny decision.
+  // Rule 9: a model DENY is a judgment, not a guarantee — model confidence is
+  // not proof of safety, so only a sufficiently supported deny (high confidence
+  // and a near-zero approval probability) blocks execution. Every uncertain
+  // model deny escalates to a human. The rules above are deterministic
+  // prohibitions: they may DENY regardless of the model's own verdict.
   if (modelVerdict === 'DENY') {
     if (confidence >= t.minConfidence && (approveProbability === 0 || approveProbability < 0.2)) {
       return result('DENY', 'model_deny', 'The model classified this operation as prohibited.', modelVerdict, confidence)

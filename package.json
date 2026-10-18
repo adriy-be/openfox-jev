@@ -7,7 +7,7 @@
   "author": "adriy-be",
   "license": "MIT",
   "scripts": {
-    "test": "node --test 'tests/*.test.js'",
+    "test": "node --test tests/*.test.js",
     "bench": "node benchmark/run.js"
   },
   "openfox": {
@@ -17,7 +17,7 @@
     "description": "Replaces manual approval prompts with intelligent decisions from a System One compatible decision model, reusing OpenFox providers.",
     "icon": "shield",
     "capabilities": ["settings", "rpc", "providers"],
-    "timeoutMs": 30000
+    "timeoutMs": 15000
   },
   "engines": {
     "node": ">=20"

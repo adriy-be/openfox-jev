@@ -28,6 +28,25 @@ describe('endpoint resolution', () => {
     )
   })
 
+  it('rejects an explicit openrouter backendKind paired with a DeepInfra provider origin', () => {
+    assert.throws(
+      () => resolveEndpoint({ url: 'https://api.deepinfra.com/v1/openai' }, { backendKind: 'openrouter' }),
+      /does not match the verified openrouter origin/,
+    )
+  })
+
+  it('rejects an explicit deepinfra backendKind paired with an OpenRouter provider origin', () => {
+    assert.throws(
+      () => resolveEndpoint({ url: 'https://openrouter.ai/api/v1' }, { backendKind: 'deepinfra' }),
+      /does not match the verified deepinfra origin/,
+    )
+  })
+
+  it('auto-detection never mismatches: a DeepInfra provider resolves as deepinfra', () => {
+    const result = resolveEndpoint({ url: 'https://api.deepinfra.com/v1/openai' }, {})
+    assert.equal(result.endpointKey, 'decisions')
+  })
+
   it('never blindly appends /v1/systemone to a cloud URL', () => {
     assert.throws(() => resolveEndpoint({ url: 'https://openrouter.ai/api/v1' }, { backendKind: 'local' }), /loopback/)
   })

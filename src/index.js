@@ -1,6 +1,6 @@
 import { createReviewer, readConfig, MODES } from './reviewer.js'
 import { createAuditLog } from './audit.js'
-import { DEFAULT_MODEL, LOCAL_DEFAULT_URL, BACKEND_KINDS, isRemoteBackend } from './providers.js'
+import { DEFAULT_MODEL, LOCAL_DEFAULT_URL, BACKEND_KINDS, isRemoteBackend, detectKind, defaultModelFor } from './providers.js'
 import { QUESTIONS } from './client.js'
 import { POLICY_VERSION } from './policy.js'
 
@@ -42,8 +42,8 @@ const SETTINGS_FIELDS = [
     section: localized('General', 'Général'),
     label: localized('Approval timeout (ms)', 'Délai d’approbation (ms)'),
     description: localized(
-      'Backend requests that exceed this timeout escalate to manual confirmation.',
-      'Les requêtes backend dépassant ce délai passent en confirmation manuelle.',
+      'Backend requests that exceed this timeout escalate to manual confirmation. Capped at 15000 ms — the OpenFox host cancels a reviewer after 15 s, so a larger value could never take effect.',
+      'Les requêtes backend dépassant ce délai passent en confirmation manuelle. Plafonné à 15000 ms — OpenFox annule un reviewer après 15 s, une valeur plus grande ne pourrait jamais prendre effet.',
     ),
     default: 15000,
   },
@@ -150,8 +150,8 @@ const SETTINGS_FIELDS = [
     section: localized('Approval policy', 'Politique d’approbation'),
     label: localized('Operator policy', 'Politique de l’opérateur'),
     description: localized(
-      'Trusted instructions for the decision model, e.g. "Routine read-only git commands are allowed."',
-      'Instructions de confiance pour le modèle de décision, p. ex. « Les commandes git en lecture seule sont autorisées. »',
+      'REQUIRED for any automatic approval: without an explicit policy, the plugin can only escalate (every request still asks). Write narrow, conservative trust rules. Example: "Routine read-only git commands (status, log, diff) are allowed. Everything else requires confirmation."',
+      'REQUIS pour toute approbation automatique : sans politique explicite, le plugin ne peut qu’escalader (chaque demande demande confirmation). Rédigez des règles de confiance étroites et prudentes. Exemple : « Les commandes git en lecture seule (status, log, diff) sont autorisées. Tout le reste nécessite une confirmation. »',
     ),
     default: '',
   },
@@ -189,10 +189,21 @@ const SETTINGS_FIELDS = [
     section: localized('Approval policy', 'Politique d’approbation'),
     label: localized('Audit logging', 'Journalisation d’audit'),
     description: localized(
-      'Structured JSONL records with redacted/hashed operations. Logging failures never change decisions.',
-      'Enregistrements JSONL structurés avec opérations rédigées/hachées. Les échecs de journalisation ne changent jamais les décisions.',
+      'Structured JSONL records with keyed, non-reversible operation fingerprints. Logging failures never change decisions.',
+      'Enregistrements JSONL structurés avec empreintes d’opération chiffrées et irréversibles. Les échecs de journalisation ne changent jamais les décisions.',
     ),
     default: true,
+  },
+  {
+    key: 'auditVerboseOperation',
+    type: 'boolean',
+    section: localized('Approval policy', 'Politique d’approbation'),
+    label: localized('Verbose operation logging (privacy)', 'Journalisation détaillée des opérations (confidentialité)'),
+    description: localized(
+      'When on, the redacted (secret-free) operation text is also written to the audit log. Off by default: only a keyed fingerprint and metadata are stored.',
+      'Activé, le texte d’opération rédigé (sans secrets) est aussi écrit dans le journal. Désactivé par défaut : seule une empreinte chiffrée et des métadonnées sont conservées.',
+    ),
+    default: false,
   },
 
   // ── Privacy ─────────────────────────────────────────────────────────────
@@ -225,7 +236,12 @@ export function register(registry) {
     return true
   }
 
-  const audit = createAuditLog({ enabled: auditEnabledSetting })
+  const auditVerboseSetting = () => {
+    const value = getSettings().auditVerboseOperation
+    return value === true || value === 'true'
+  }
+
+  const audit = createAuditLog({ enabled: auditEnabledSetting, verboseOperation: auditVerboseSetting })
 
   const reviewer = createReviewer({
     getSettings,
@@ -241,51 +257,13 @@ export function register(registry) {
   })
 
   registry.registerRpc('testConnection', async () => {
+    const probe = await reviewer.testConnection()
     const config = readConfig(getSettings())
-    if (!config.enabled) {
-      return { installed: true, running: false, statusTone: 'warning', statusText: localized('Disabled', 'Désactivé') }
-    }
-    if (!config.providerId || !context.providerAccess) {
-      return { installed: true, running: false, statusTone: 'danger', statusText: localized('No provider selected', 'Aucun fournisseur sélectionné') }
-    }
-    const provider = context.providerAccess.getProvider(config.providerId)
-    if (!provider) {
-      return { installed: true, running: false, statusTone: 'danger', statusText: localized('Provider not found', 'Fournisseur introuvable') }
-    }
-    const remote = ['openrouter', 'deepinfra', 'custom'].includes(config.backendKind || '')
-    if (remote && !config.cloudConsent) {
-      return { installed: true, running: false, statusTone: 'warning', statusText: localized('Cloud consent required', 'Consentement cloud requis') }
-    }
-    const started = Date.now()
-    try {
-      const result = await reviewer.evaluate({
-        kind: 'command',
-        tool: 'connection_test',
-        description: 'git status',
-        workdir: '/',
-        sessionId: 'connection-test',
-      })
-      const latency = Date.now() - started
-      return {
-        installed: true,
-        running: true,
-        statusTone: 'success',
-        statusText: localized(
-          `${provider.name} · ${config.model || DEFAULT_MODEL} · ${config.mode} · ${latency} ms · ${result.meta?.decision ?? 'OK'}`,
-          `${provider.name} · ${config.model || DEFAULT_MODEL} · ${config.mode} · ${latency} ms · ${result.meta?.decision ?? 'OK'}`,
-        ),
-      }
-    } catch (error) {
-      return {
-        installed: true,
-        running: false,
-        statusTone: 'danger',
-        statusText: localized(
-          `Connection failed: ${error instanceof Error ? error.message : String(error)}`,
-          `Échec de la connexion : ${error instanceof Error ? error.message : String(error)}`,
-        ),
-      }
-    }
+    const tone = probe.ok ? 'success' : probe.statusClass === 'disabled' || probe.statusClass === 'consent_required' ? 'warning' : 'danger'
+    let text = probe.message
+    if (probe.ok && !config.operatorPolicy.trim()) text += ' No operator policy set — only escalation is possible.'
+    const detail = probe.latencyMs != null ? ` · ${probe.latencyMs} ms` : ''
+    return { installed: true, running: probe.ok, statusTone: tone, statusText: localized(text + detail, text + detail) }
   })
 
   registry.registerRpc('connectionStatus', async () => {
@@ -294,22 +272,21 @@ export function register(registry) {
       return { installed: true, running: false, statusTone: 'warning', statusText: localized('Disabled', 'Désactivé') }
     }
     const provider = config.providerId && context.providerAccess ? context.providerAccess.getProvider(config.providerId) : undefined
-    const remote = provider ? isRemoteBackend(provider, { backendKind: config.backendKind || undefined }) : config.backendKind !== 'local'
-    if (remote && !config.cloudConsent) {
+    const kind = config.backendKind || (provider ? detectKind(provider) : 'local')
+    if (isRemoteBackend(provider, { backendKind: config.backendKind || undefined }) && !config.cloudConsent) {
       return { installed: true, running: false, statusTone: 'warning', statusText: localized('Cloud consent required', 'Consentement cloud requis') }
     }
-    if (!provider && config.backendKind !== 'local') {
+    if (!provider && kind !== 'local') {
       return { installed: true, running: false, statusTone: 'danger', statusText: localized('No provider selected', 'Aucun fournisseur sélectionné') }
     }
-    return {
-      installed: true,
-      running: true,
-      statusTone: 'success',
-      statusText: localized(
-        `${provider?.name ?? 'Local Jev-Style'} · ${config.model || DEFAULT_MODEL} · ${config.mode}`,
-        `${provider?.name ?? 'Jev-Style local'} · ${config.model || DEFAULT_MODEL} · ${config.mode}`,
-      ),
+    if (provider && !provider.isActive) {
+      return { installed: true, running: false, statusTone: 'danger', statusText: localized('Provider disabled', 'Fournisseur désactivé') }
     }
+    const label = provider?.name ?? 'Local Jev-Style'
+    const model = config.model || defaultModelFor(provider, { backendKind: kind })
+    let text = `${label} · ${model} · ${config.mode}`
+    if (!config.operatorPolicy.trim()) text += ' · no operator policy (escalation only)'
+    return { installed: true, running: true, statusTone: 'success', statusText: localized(text, text) }
   })
 
   registry.registerRpc('listBackends', () => ({

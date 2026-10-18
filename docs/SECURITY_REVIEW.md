@@ -44,9 +44,21 @@ and shadow-by-default.
 requests go through `PluginContext.providerAccess.requestJson`, which resolves
 keys server-side and attaches them only to origin-verified endpoints
 (`redirect: 'error'`). The plugin's only password field is the *local* Jev key,
-used solely against loopback. Audit rows store redacted + hashed operation
-identifiers; tests assert no `Bearer`/key material appears in logs or errors.
-Error messages carry status codes only, never response bodies.
+used solely against loopback. Audit rows are **metadata-only by default**:
+the operation is stored as a keyed HMAC-SHA256 fingerprint (no unkeyed FNV-1a),
+and the raw redacted text is retained only behind an explicit
+`auditVerboseOperation` opt-in. Tests assert no `Bearer`/key material appears
+in logs or errors. Error messages carry status codes only, never response
+bodies.
+
+**Redaction limits (honest):** redaction is pattern-based and best-effort. It
+recognizes a fixed set of credential shapes (bearer tokens, API-style keys,
+AWS keys, private key blocks, JWTs, `key=value` pairs, embedded URL
+credentials). Arbitrary, unpatterned secrets are **not guaranteed to be
+detected** and may still egress. The `redaction_incomplete` escalation fires
+only when a pattern *did* match and decision-critical context was removed —
+it is a safety net against redacted context, not a guarantee that every secret
+is caught.
 
 ### S5 — SSRF / cross-origin forwarding (residual risk: low)
 **Status: mitigated + tested.** Endpoint resolution is an explicit origin map
@@ -63,7 +75,8 @@ confidence/noul ∈ [0,1], score within legend bounds. Any violation ⇒
 (test: "never uses chat-completion text").
 
 ### S7 — Backend unavailability / DoS (residual risk: low)
-**Status: mitigated.** Strict timeout (default 15 s, capped 60 s), 1 MB
+**Status: mitigated.** Strict timeout (default 15 s, capped 15 s to the
+upstream reviewer limit), 1 MB
 response cap, 12 k-char state cap with truncation flag (truncated ⇒ never
 APPROVE), upstream reviewer timeout (15 s) falls back to native ask. Offline,
 timeout and error classes all escalate — never approve.
@@ -92,7 +105,7 @@ upstream extension ⇒ plugin registers but no reviewer is consulted.
 
 ## Test evidence
 
-- Plugin: 130 node:test cases (providers, protocol, policy, security,
+- Plugin: 216 node:test cases (providers, protocol, policy, security,
   reviewer, integration incl. real loopback server).
 - Upstream: 46 new vitest cases; full OpenFox suite 6048 tests pass; typecheck
   and eslint clean.

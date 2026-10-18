@@ -1,7 +1,9 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { homedir } from 'node:os'
-import { redactSecrets, redactState, evaluateSecurity, hashId } from '../src/security.js'
+import { homedir, tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from 'node:fs'
+import { redactSecrets, redactState, evaluateSecurity, hashId, resolvePhysicalPath } from '../src/security.js'
 
 describe('secret redaction', () => {
   it('redacts bearer tokens', () => {
@@ -32,6 +34,28 @@ describe('secret redaction', () => {
     const { text, redacted } = redactSecrets('git status')
     assert.equal(redacted, false)
     assert.equal(text, 'git status')
+  })
+
+  it('redacts secrets embedded in file paths', () => {
+    const { text, redacted } = redactSecrets('cp /home/u/.config/tokens/sk-abcdef1234567890.json /w/')
+    assert.equal(redacted, true)
+    assert.ok(!text.includes('sk-abcdef1234567890'))
+    assert.ok(text.includes('[REDACTED]'))
+  })
+
+  it('redacts secrets in the description and paths fields of a state object', () => {
+    const { state, redacted } = redactState({
+      tool: 'read_file',
+      command: '',
+      description: 'Read the password=hunter2secretfile config',
+      paths: ['/home/u/creds/pk-abcdef1234567890.json'],
+    })
+    assert.equal(redacted, true)
+    const dump = JSON.stringify(state)
+    assert.ok(!dump.includes('hunter2secretfile'))
+    assert.ok(!dump.includes('pk-abcdef1234567890'))
+    assert.ok(state.description.includes('[REDACTED]'))
+    assert.ok(state.paths[0].includes('[REDACTED]'))
   })
 
   it('redacts nested state objects', () => {
@@ -222,5 +246,171 @@ describe('file access security rules', () => {
       evaluateSecurity({ tool: 'run_command', command: 'git status', workdir: '/w', reason: 'dangerous_command' }).decision,
       null,
     )
+  })
+})
+
+describe('secure project path containment', () => {
+  const WORK = '/workspace/project'
+  const writeOp = (path, workdir = WORK) => evaluateSecurity({ tool: 'write_file', paths: [path], workdir })
+
+  it('escalates a sibling directory that shares the workdir prefix', () => {
+    const r = writeOp('/workspace/project-evil/x.js')
+    assert.equal(r.decision, 'ESCALATE')
+    assert.equal(r.ruleId, 'write_outside_project')
+  })
+
+  it('rejects ../ traversal that lands outside the workdir', () => {
+    assert.equal(writeOp('/workspace/project/../project-evil/x.js').decision, 'ESCALATE')
+  })
+
+  it('rejects deep ../ traversal escaping to /etc', () => {
+    assert.equal(writeOp('/workspace/project/../../etc/passwd').decision, 'ESCALATE')
+  })
+
+  it('allows a relative path that stays inside the workdir', () => {
+    assert.equal(writeOp('src/a.js').decision, null)
+  })
+
+  it('rejects a relative path that escapes the workdir', () => {
+    assert.equal(writeOp('../evil.js').decision, 'ESCALATE')
+  })
+
+  it('allows a non-existing target inside the workdir', () => {
+    assert.equal(writeOp('/workspace/project/new/deep/file.txt').decision, null)
+  })
+
+  it('escalates writes to the filesystem root', () => {
+    assert.equal(writeOp('/').decision, 'ESCALATE')
+  })
+
+  it('escalates writes to the home directory', () => {
+    assert.equal(evaluateSecurity({ tool: 'edit_file', paths: [homedir()], workdir: '/w' }).decision, 'ESCALATE')
+  })
+
+  it('handles Windows-style paths textually', () => {
+    const win = (path, workdir) => evaluateSecurity({ tool: 'write_file', paths: [path], workdir })
+    assert.equal(win('C:/workspace/project/src/a.js', 'C:/workspace/project').decision, null)
+    assert.equal(win('C:/workspace/project-evil/x.js', 'C:/workspace/project').decision, 'ESCALATE')
+    assert.equal(win('C:/workspace/project/../evil.js', 'C:/workspace/project').decision, 'ESCALATE')
+  })
+
+  it('catches a symlink inside the workdir that points outside', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jev-contain-'))
+    try {
+      const work = join(dir, 'work')
+      mkdirSync(work)
+      symlinkSync('/etc', join(work, 'link'))
+      assert.equal(evaluateSecurity({ tool: 'write_file', paths: [join(work, 'ok.txt')], workdir: work }).decision, null)
+      const escaped = evaluateSecurity({ tool: 'write_file', paths: [join(work, 'link', 'passwd')], workdir: work })
+      assert.equal(escaped.decision, 'ESCALATE')
+      assert.equal(escaped.ruleId, 'write_outside_project')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps the /tmp and /var/tmp exceptions narrow (no sibling prefix)', () => {
+    assert.equal(writeOp('/tmp/scratch.txt').decision, null)
+    assert.equal(writeOp('/var/tmp/scratch.txt').decision, null)
+    assert.equal(writeOp('/tmp-evil/x.txt').decision, 'ESCALATE')
+  })
+})
+
+describe('symlink escape containment (real filesystem)', () => {
+  function workdirFixture() {
+    const dir = mkdtempSync(join(tmpdir(), 'jev-sym-'))
+    const work = join(dir, 'work')
+    mkdirSync(work)
+    return { dir, work }
+  }
+
+  it('rejects a symlink followed by .. that escapes the workdir', () => {
+    const { dir, work } = workdirFixture()
+    try {
+      symlinkSync('/etc', join(work, 'link'))
+      // String concat keeps the raw `..` intact: the OS resolves the symlink
+      // before the .., landing in / — outside the workdir.
+      const escaped = `${work}/link/../secret.txt`
+      const r = evaluateSecurity({ tool: 'write_file', paths: [escaped], workdir: work })
+      assert.equal(r.decision, 'ESCALATE')
+      assert.equal(r.ruleId, 'write_outside_project')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a non-existing target under a symlinked parent that points outside', () => {
+    const { dir, work } = workdirFixture()
+    try {
+      symlinkSync('/etc', join(work, 'link'))
+      const r = evaluateSecurity({ tool: 'write_file', paths: [`${work}/link/brand-new.txt`], workdir: work })
+      assert.equal(r.decision, 'ESCALATE')
+      assert.equal(r.ruleId, 'write_outside_project')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('still allows writes inside a symlinked workdir, but not through an inner escaping symlink', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jev-sym-'))
+    try {
+      const real = join(dir, 'realwork')
+      const linkwork = join(dir, 'worklink')
+      mkdirSync(real)
+      symlinkSync(real, linkwork)
+      assert.equal(evaluateSecurity({ tool: 'write_file', paths: [join(linkwork, 'src', 'a.js')], workdir: linkwork }).decision, null)
+      assert.equal(evaluateSecurity({ tool: 'write_file', paths: ['src/a.js'], workdir: linkwork }).decision, null)
+      symlinkSync('/etc', join(linkwork, 'link'))
+      const escaped = evaluateSecurity({ tool: 'write_file', paths: [`${linkwork}/link/shadow`], workdir: linkwork })
+      assert.equal(escaped.decision, 'ESCALATE')
+      assert.equal(escaped.ruleId, 'write_outside_project')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('allows a legitimate relative and absolute write that stays inside the project', () => {
+    const { dir, work } = workdirFixture()
+    try {
+      assert.equal(evaluateSecurity({ tool: 'write_file', paths: ['src/ok.js'], workdir: work }).decision, null)
+      assert.equal(evaluateSecurity({ tool: 'write_file', paths: [join(work, 'src', 'ok.js')], workdir: work }).decision, null)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('physically resolves Windows drive-letter roots (no lexical early-out, no / re-root)', () => {
+    // Nothing under C:/ exists on POSIX CI, so this pins the drive-aware branch:
+    // the resolver must keep the C: root and the raw .. intact rather than
+    // re-rooting to / or bailing out before physical resolution runs.
+    const resolved = resolvePhysicalPath('C:/work/link/../secret.txt')
+    assert.ok(resolved.startsWith('C:/'), 'drive root must be preserved')
+    assert.ok(!resolved.startsWith('//') && !/^\/[^C]/.test(resolved), 'must not be re-rooted to /')
+    assert.ok(resolved.includes('..'), 'the .. must survive for the kernel to resolve')
+  })
+})
+
+describe('canonical operation text (rules and model judge the same text)', () => {
+  it('an empty command with a dangerous description is judged from the description', () => {
+    const r = evaluateSecurity({ tool: 'run_command', command: '', description: 'rm -rf /' })
+    assert.equal(r.decision, 'DENY')
+    assert.equal(r.ruleId, 'wipe_home_or_root')
+  })
+
+  it('a whitespace-only command with a dangerous description cannot bypass the rules', () => {
+    const r = evaluateSecurity({ tool: 'run_command', command: '   ', description: 'rm -rf /' })
+    assert.equal(r.decision, 'DENY')
+    assert.equal(r.ruleId, 'wipe_home_or_root')
+  })
+
+  it('a valid command always takes priority over the description', () => {
+    const r = evaluateSecurity({ tool: 'run_command', command: 'git status', description: 'rm -rf /' })
+    assert.equal(r.decision, null, 'the benign command — not the description — is what the rules judge')
+  })
+
+  it('with neither command nor description, the synthesized file access text is judged', () => {
+    const r = evaluateSecurity({ tool: 'read_file', paths: ['/home/u/.ssh/id_rsa'] })
+    assert.equal(r.decision, 'DENY')
+    assert.equal(r.ruleId, 'private_key_access')
   })
 })

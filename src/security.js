@@ -1,4 +1,6 @@
 import { homedir } from 'node:os'
+import { lstatSync, readlinkSync, realpathSync } from 'node:fs'
+import { posix } from 'node:path'
 
 const SECRET_PATTERNS = [
   // Bearer/API-style tokens
@@ -67,6 +69,161 @@ export function hashId(text) {
     h1 = Math.imul(h1, 0x01000193)
   }
   return (h1 >>> 0).toString(16).padStart(8, '0')
+}
+
+const WRITE_TOOLS = new Set(['write_file', 'edit_file'])
+
+/**
+ * Explicit description for pure File Access requests (no command/description).
+ * Judging an empty operation is unreliable, so the model and the deterministic
+ * rules are both given this synthesized text instead of a blank.
+ */
+export function fileAccessOperation(context) {
+  const paths = Array.isArray(context?.paths) ? context.paths.filter(Boolean) : []
+  if (paths.length === 0) return ''
+  const access = WRITE_TOOLS.has(context?.tool) ? 'write' : 'read'
+  const reason = context?.reason ? ` — reason: ${context.reason}` : ''
+  return `File access request: ${context?.tool ?? 'unknown tool'} wants ${access} access to ${paths.join(', ')}${reason}`
+}
+
+/**
+ * Canonical operation-text selection. The first non-blank of
+ * command/description, else the synthesized File Access description, else ''.
+ * Deterministic security rules, model state and the audit id all derive their
+ * operation text from this single source so they can never judge different
+ * texts. An empty or whitespace-only command cannot bypass the rules.
+ */
+export function resolveOperationText(context) {
+  const direct = [context?.command, context?.description].find((s) => typeof s === 'string' && s.trim() !== '')
+  if (direct !== undefined) return direct
+  return fileAccessOperation(context)
+}
+
+/**
+ * Textual path normalization for containment checks. Unifies separators,
+ * resolves `.`/`..` segments, and resolves relative paths against `base`.
+ * Handles both POSIX and Windows (drive-letter) paths as plain text.
+ */
+export function normalizePathText(p, base) {
+  if (typeof p !== 'string' || p.length === 0) return ''
+  let s = p.replace(/\\/g, '/')
+  const drive = /^[a-zA-Z]:/.test(s) ? s.slice(0, 2) : ''
+  if (drive) s = s.slice(2)
+  const rooted = s.startsWith('/')
+  if (!rooted) {
+    const b = base ? base.replace(/\\/g, '/').replace(/^[a-zA-Z]:/, '') : ''
+    s = (b.startsWith('/') ? b : '/' + b) + '/' + s
+  }
+  const norm = posix.normalize(s)
+  return drive ? drive + norm : norm
+}
+
+function tryRealpath(p) {
+  try {
+    return realpathSync(p).replace(/\\/g, '/')
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Absolute form of `candidate` without lexical `.`/`..` resolution, so that
+ * symlink segments and `..` survive for the filesystem to resolve. Relative
+ * candidates are joined onto `workdir` verbatim.
+ */
+function originalAbsPath(candidate, workdir) {
+  let s = candidate.replace(/\\/g, '/')
+  if (!s.startsWith('/') && !/^[a-zA-Z]:/.test(s)) {
+    const base = workdir.replace(/\\/g, '/').replace(/\/+$/, '')
+    s = base + '/' + s
+  }
+  return s
+}
+
+/**
+ * Physical path resolution, mirroring how the OS resolves a path: symlinks are
+ * followed and `..` steps back from the CURRENT physical location, not the
+ * textual one. Node's realpathSync resolves `symlink/..` logically (back to the
+ * symlink's own directory), which hides exactly the escape we must catch, so
+ * the path is resolved component by component here instead.
+ *
+ * Handles both POSIX (/…) and Windows (X:…) roots: a drive letter is treated
+ * as the root exactly like `/`, so containment works identically on both.
+ *
+ * Returns the physical absolute path (deepest existing prefix plus any
+ * non-existing tail), or null when the path is unresolvable (symlink loop).
+ */
+export function resolvePhysicalPath(p, maxSymlinks = 40) {
+  const s = p.replace(/\\/g, '/')
+  const drive = /^[a-zA-Z]:/.test(s) ? s.slice(0, 2) : null
+  let base = drive || '/'
+  const comps = (drive ? s.slice(2) : s).split('/').filter((c) => c !== '' && c !== '.')
+  const stack = []
+  let symlinks = 0
+  let i = 0
+  const abs = () => (base === '/' ? (stack.length ? '/' + stack.join('/') : '/') : base + '/' + stack.join('/'))
+  while (i < comps.length) {
+    const comp = comps[i]
+    if (comp === '..') {
+      stack.pop()
+      i += 1
+      continue
+    }
+    stack.push(comp)
+    const candidate = abs()
+    let st
+    try {
+      st = lstatSync(candidate)
+    } catch {
+      const tail = comps.slice(i + 1).join('/')
+      return abs() + (tail ? '/' + tail : '')
+    }
+    if (st.isSymbolicLink()) {
+      symlinks += 1
+      if (symlinks > maxSymlinks) return null
+      const target = readlinkSync(candidate).replace(/\\/g, '/')
+      stack.pop()
+      const targetDrive = /^[a-zA-Z]:/.test(target) ? target.slice(0, 2) : null
+      if (target.startsWith('/') || targetDrive) {
+        base = targetDrive || '/'
+        stack.length = 0
+      }
+      const targetComps = target.replace(/^[a-zA-Z]:/, '').split('/').filter((c) => c !== '' && c !== '.')
+      comps.splice(i, 1, ...targetComps)
+      continue
+    }
+    i += 1
+  }
+  return abs()
+}
+
+/**
+ * Whether `candidate` is contained within `workdir`. Conservative and
+ * fail-closed: an empty/ambiguous workdir, a textual escape, or a symlink that
+ * resolves outside the workdir all count as NOT contained (→ escalate).
+ *
+ * Symlink escapes are detected by physically resolving the ORIGINAL (not
+ * lexically normalized) path: normalization would collapse `symlink/..` to the
+ * textual parent and hide the escape, whereas the kernel resolves the symlink
+ * before the `..`. Unresolvable paths (symlink loops) are rejected.
+ */
+export function isWithinProject(candidate, workdir) {
+  if (!workdir || !candidate) return false
+  const rootNorm = normalizePathText(workdir)
+  const candNorm = normalizePathText(candidate, workdir)
+  if (candNorm !== rootNorm && !candNorm.startsWith(rootNorm + '/')) return false
+  const rootReal = tryRealpath(workdir)
+  if (!rootReal) return true
+  // Physical resolution runs for POSIX and Windows (drive-letter) roots alike.
+  const candReal = resolvePhysicalPath(originalAbsPath(candidate, workdir))
+  if (candReal === null) return false
+  return candReal === rootReal || candReal.startsWith(rootReal + '/')
+}
+
+const TMP_EXCEPTIONS = ['/tmp', '/var/tmp']
+
+function isTmpException(path) {
+  return TMP_EXCEPTIONS.some((t) => isWithinProject(path, t))
 }
 
 /**
@@ -176,12 +333,7 @@ const HARD_DENY = [
     test: (op) => {
       if (op.tool !== 'write_file' && op.tool !== 'edit_file') return false
       const workdir = op.workdir ?? ''
-      return (op.paths ?? []).some(
-        (p) =>
-          !p.startsWith('/tmp/') &&
-          !p.startsWith('/var/tmp/') &&
-          (!workdir || !p.startsWith(workdir)),
-      )
+      return (op.paths ?? []).some((p) => !isTmpException(p) && !isWithinProject(p, workdir))
     },
     decision: 'ESCALATE',
   },
@@ -203,7 +355,7 @@ const HARD_DENY = [
 export function evaluateSecurity(operation) {
   const op = {
     tool: operation?.tool ?? '',
-    command: operation?.command ?? operation?.description ?? '',
+    command: resolveOperationText(operation),
     paths: Array.isArray(operation?.paths) ? operation.paths : [],
     workdir: operation?.workdir ?? '',
     reason: operation?.reason ?? null,

@@ -1,8 +1,10 @@
 import { decide, DEFAULT_MODEL as CLIENT_DEFAULT_MODEL, QUESTIONS, combineSignals } from './client.js'
 import { applyPolicy, POLICY_VERSION, DEFAULT_THRESHOLDS } from './policy.js'
-import { evaluateSecurity, redactState } from './security.js'
+import { evaluateSecurity, redactState, resolveOperationText } from './security.js'
 import { createAuditLog } from './audit.js'
 import { resolveEndpoint, detectKind, isRemoteBackend, defaultModelFor, isLoopbackUrl } from './providers.js'
+
+export { fileAccessOperation } from './security.js'
 
 export const MODES = ['shadow', 'enforce']
 
@@ -39,7 +41,7 @@ export function readConfig(settings = {}) {
     localApiKey: typeof settings.localApiKey === 'string' ? settings.localApiKey : '',
     customEndpoint: typeof settings.customEndpoint === 'string' ? settings.customEndpoint : '',
     operatorPolicy: typeof settings.operatorPolicy === 'string' ? settings.operatorPolicy : '',
-    timeoutMs: Math.min(Math.max(num(settings.timeoutMs, 15_000), 1_000), 60_000),
+    timeoutMs: Math.min(Math.max(num(settings.timeoutMs, 15_000), 1_000), 15_000),
     cloudConsent: bool(settings.cloudConsent, false),
     auditEnabled: bool(settings.auditEnabled, true),
     thresholds: {
@@ -56,23 +58,11 @@ export function readConfig(settings = {}) {
  * Tool arguments and repository content are untrusted data; the operator
  * policy is trusted and clearly separated.
  */
-const WRITE_TOOLS = new Set(['write_file', 'edit_file'])
-
-// Judging an empty operation is unreliable; pure File Access requests get an explicit description.
-export function fileAccessOperation(context) {
-  const paths = Array.isArray(context?.paths) ? context.paths.filter(Boolean) : []
-  if (paths.length === 0) return ''
-  const access = WRITE_TOOLS.has(context?.tool) ? 'write' : 'read'
-  const reason = context?.reason ? ` — reason: ${context.reason}` : ''
-  return `File access request: ${context?.tool ?? 'unknown tool'} wants ${access} access to ${paths.join(', ')}${reason}`
-}
-
 export function buildState(context, config) {
-  const hasOperationText = Boolean(context.command) || Boolean(context.description)
   return {
     tool: context.tool ?? '',
     kind: context.kind ?? 'path',
-    command: hasOperationText ? context.command ?? context.description ?? '' : fileAccessOperation(context),
+    command: resolveOperationText(context),
     paths: context.paths ?? [],
     workdir: context.workdir ?? '',
     reason: context.reason ?? null,
@@ -122,6 +112,45 @@ function transportFor(providerAccess, provider, config) {
 
   return (key, body, timeoutMs, signal) =>
     providerAccess.requestJson(provider.id, key, body, signal ? { timeoutMs, signal } : { timeoutMs })
+}
+
+/**
+ * Map a System One error class to a connection-probe status class. The probe
+ * must distinguish transport/protocol failures so the UI can explain what is
+ * wrong without ever leaking credentials or response bodies.
+ */
+function mapProbeError(errorClass) {
+  switch (errorClass) {
+    case 'offline':
+    case 'http_error':
+      return 'unreachable'
+    case 'timeout':
+      return 'timeout'
+    case 'invalid_response':
+      return 'invalid_schema'
+    case 'auth':
+      return 'auth'
+    case 'provider_unavailable':
+      return 'provider_missing'
+    default:
+      return 'error'
+  }
+}
+
+// Fixed, class-specific messages. Raw transport exception text (which may
+// carry URLs, credentials or response bodies) is never surfaced — the status
+// class alone is what an operator needs to act on.
+function probeMessage(statusClass) {
+  return (
+    {
+      unreachable: 'The decision backend could not be reached.',
+      timeout: 'The decision backend did not respond in time.',
+      invalid_schema: 'The backend responded but with an invalid System One schema.',
+      auth: 'Authentication failed — check the provider credential.',
+      provider_missing: 'The selected provider is missing or has no credential.',
+      error: 'The connection test failed.',
+    }[statusClass] ?? 'The connection test failed.'
+  )
 }
 
 /**
@@ -207,7 +236,7 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
    */
   async function evaluate(context) {
     const config = readConfig(getSettings() ?? {})
-    const operationText = context.command || context.description || fileAccessOperation(context) || context.tool || ''
+    const operationText = resolveOperationText(context) || context.tool || ''
 
     if (!config.enabled) return { action: 'ask', reason: 'Smart approvals disabled.', meta: { decision: 'ESCALATE', ruleId: 'disabled', humanApprovalRequired: true } }
 
@@ -220,16 +249,24 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
     }
 
     // Mandatory deterministic security rules run first and are not optional.
+    // In shadow mode the prediction is still evaluated and logged, but never
+    // enforced: the native confirmation flow is always preserved.
     const security = evaluateSecurity(context)
     if (security.decision === 'DENY') {
+      if (config.mode === 'shadow') {
+        const meta = { decision: 'DENY', ruleId: security.ruleId, outcome: 'shadow_deny', humanApprovalRequired: true, modelVerdict: null, confidence: 0, approvalProbability: 0 }
+        record(config, null, context, meta, operationText)
+        return { action: 'ask', reason: `Shadow mode: predicted DENY (${security.reason}) — native approval flow preserved.`, meta }
+      }
       const meta = { decision: 'DENY', ruleId: security.ruleId, outcome: 'denied', humanApprovalRequired: false, modelVerdict: null, confidence: 0, approvalProbability: 0 }
       record(config, null, context, meta, operationText)
       return { action: 'deny', reason: security.reason, meta }
     }
     if (security.decision === 'ESCALATE') {
-      const meta = { decision: 'ESCALATE', ruleId: security.ruleId, outcome: 'escalated_mandatory', humanApprovalRequired: true, modelVerdict: null, confidence: 0, approvalProbability: 0 }
+      const shadow = config.mode === 'shadow'
+      const meta = { decision: 'ESCALATE', ruleId: security.ruleId, outcome: shadow ? 'shadow_escalate' : 'escalated_mandatory', humanApprovalRequired: true, modelVerdict: null, confidence: 0, approvalProbability: 0 }
       record(config, null, context, meta, operationText)
-      return { action: 'ask', reason: security.reason, meta }
+      return { action: 'ask', reason: shadow ? `Shadow mode: predicted ESCALATE (${security.reason}) — native approval flow preserved.` : security.reason, meta }
     }
 
     const provider = config.providerId && providerAccess ? providerAccess.getProvider(config.providerId) : undefined
@@ -285,12 +322,24 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
       return { action: 'ask', reason: 'Decision backend returned no usable assessment.', meta }
     }
 
+    // A late response cannot authorize an operation that was cancelled while
+    // we waited: re-check the signal after the backend round-trip.
+    if (context.signal?.aborted) {
+      const meta = { decision: 'ESCALATE', ruleId: 'cancelled', outcome: 'escalated_cancelled', humanApprovalRequired: true, errorClass: 'cancelled', latencyMs: assessment.latencyMs, model: assessment.model }
+      record(config, provider, context, meta, operationText)
+      return { action: 'ask', reason: 'Operation was cancelled; falling back to manual confirmation.', meta }
+    }
+
     const verdictEntry = assessment.answers.verdict
     const policy = applyPolicy(
       assessment.answers,
       {
         truncated: assessment.truncated,
-        redactedIncomplete: assessment.redacted && assessment.truncated,
+        // Redaction and truncation are independent concerns. If redaction
+        // removed any material we cannot be sure the remaining text still
+        // carries the decision-critical facts, so a redacted operation is
+        // never auto-approved (conservative escalation).
+        redactedIncomplete: assessment.redacted,
         hasPolicy: Boolean(config.operatorPolicy && config.operatorPolicy.trim()),
         security: { decision: null },
       },
@@ -328,5 +377,49 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
     return { action: 'ask', reason: policy.reason, meta }
   }
 
-  return { evaluate, questions: QUESTIONS, defaultModel: CLIENT_DEFAULT_MODEL }
+  /**
+   * Genuine backend connectivity + protocol probe. Sends one minimal, benign
+   * System One request and validates the response structure. Never uses an
+   * approval outcome as proof of connectivity. Returns
+   *   { ok, statusClass, message, latencyMs }
+   * statusClass ∈ 'success' | 'disabled' | 'provider_missing' | 'consent_required'
+   *               | 'timeout' | 'auth' | 'invalid_schema' | 'unreachable' | 'error'
+   */
+  async function testConnection() {
+    const config = readConfig(getSettings() ?? {})
+    if (!config.enabled) {
+      return { ok: false, statusClass: 'disabled', message: 'Smart approvals are disabled.', latencyMs: null }
+    }
+    const provider = config.providerId && providerAccess ? providerAccess.getProvider(config.providerId) : undefined
+    const kind = config.backendKind || (provider ? detectKind(provider) : 'local')
+    if (kind !== 'local' && !provider) {
+      return { ok: false, statusClass: 'provider_missing', message: 'No decision provider is selected for this backend.', latencyMs: null }
+    }
+    if (provider && !provider.isActive) {
+      return { ok: false, statusClass: 'provider_missing', message: 'The selected provider is disabled.', latencyMs: null }
+    }
+    if (isRemoteBackend(provider, { backendKind: config.backendKind || undefined }) && !config.cloudConsent) {
+      return { ok: false, statusClass: 'consent_required', message: 'Cloud inference requires privacy consent.', latencyMs: null }
+    }
+    let transport
+    try {
+      transport = transportFor(providerAccess, provider, config)
+    } catch {
+      return { ok: false, statusClass: 'error', message: probeMessage('error'), latencyMs: null }
+    }
+    const result = await decide({
+      transport,
+      endpointKey: kind === 'local' ? 'systemone' : 'decisions',
+      model: config.model || defaultModelFor(provider, { backendKind: kind }),
+      state: 'Connection probe: classify this trivial no-op.',
+      timeoutMs: config.timeoutMs,
+    })
+    if (result.ok) {
+      return { ok: true, statusClass: 'success', message: 'Backend responded with a valid System One schema.', latencyMs: result.latencyMs }
+    }
+    const statusClass = mapProbeError(result.errorClass)
+    return { ok: false, statusClass, message: probeMessage(statusClass), latencyMs: result.latencyMs }
+  }
+
+  return { evaluate, testConnection, questions: QUESTIONS, defaultModel: CLIENT_DEFAULT_MODEL }
 }
