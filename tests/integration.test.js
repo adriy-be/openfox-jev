@@ -592,7 +592,8 @@ describe('File Access (folder access) end-to-end', () => {
       const rows = readFileSync(join(dir, 'd.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line))
       assert.equal(rows.length, 1)
       assert.equal(rows[0].operationCategory, 'file_access')
-      assert.ok(rows[0].operationRedacted.includes('File access request'))
+      assert.ok(rows[0].operationHash)
+      assert.equal(rows[0].operationRedacted, null, 'metadata-only by default')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -634,6 +635,142 @@ describe('File Access (folder access) end-to-end', () => {
       assert.equal(result.action, 'allow')
       assert.equal(received.length, 1)
       assert.ok(received[0].state.includes('File access request: read_file wants read access to /srv/git/other-project'))
+    } finally {
+      server.close()
+    }
+  })
+})
+
+describe('connection probe — genuine connectivity/protocol test', () => {
+  function loopbackServer(handler) {
+    const server = createServer((req, res) => {
+      let body = ''
+      req.on('data', (chunk) => {
+        body += chunk
+      })
+      req.on('end', () => handler(req, res, body))
+    })
+    return server
+  }
+
+  it('reports success only when the backend returns a valid System One schema (local, no provider)', async () => {
+    const server = loopbackServer((req, res) => {
+      if (req.url === '/v1/systemone' && req.method === 'POST') {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(jevAnswer('APPROVE')))
+        return
+      }
+      res.writeHead(404)
+      res.end()
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const port = server.address().port
+      const registered = makeRegistry({ enabled: true, mode: 'enforce', providerId: '', backendKind: 'local', localUrl: `http://127.0.0.1:${port}` }, undefined)
+      const out = await registered.rpc.get('testConnection')()
+      assert.equal(out.running, true)
+      assert.equal(out.statusTone, 'success')
+      assert.match(out.statusText.en, /valid System One schema/)
+      assert.match(out.statusText.en, /\d+ ms/)
+    } finally {
+      server.close()
+    }
+  })
+
+  it('an offline backend reports failure, never success (no more false positives)', async () => {
+    const registered = makeRegistry({ enabled: true, mode: 'enforce', backendKind: 'local', localUrl: 'http://127.0.0.1:1' }, undefined)
+    const out = await registered.rpc.get('testConnection')()
+    assert.equal(out.running, false)
+    assert.equal(out.statusTone, 'danger')
+    assert.match(out.statusText.en, /could not be reached/)
+  })
+
+  it('a slow backend reports a timeout, not a success', async () => {
+    const server = loopbackServer((req, res) => {
+      setTimeout(() => {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(jevAnswer('APPROVE')))
+      }, 2_000)
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const port = server.address().port
+      const registered = makeRegistry({ enabled: true, mode: 'enforce', backendKind: 'local', localUrl: `http://127.0.0.1:${port}`, timeoutMs: 60 }, undefined)
+      const out = await registered.rpc.get('testConnection')()
+      assert.equal(out.running, false)
+      assert.equal(out.statusTone, 'danger')
+      assert.match(out.statusText.en, /did not respond in time/)
+    } finally {
+      server.close()
+    }
+  })
+
+  it('a backend returning a non-System One body reports an invalid schema', async () => {
+    const server = loopbackServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ choices: [{ message: 'APPROVE' }] }))
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const port = server.address().port
+      const registered = makeRegistry({ enabled: true, mode: 'enforce', backendKind: 'local', localUrl: `http://127.0.0.1:${port}` }, undefined)
+      const out = await registered.rpc.get('testConnection')()
+      assert.equal(out.running, false)
+      assert.equal(out.statusTone, 'danger')
+      assert.match(out.statusText.en, /invalid System One schema/)
+    } finally {
+      server.close()
+    }
+  })
+
+  it('a cloud backend without a selected provider reports provider missing (no network call)', async () => {
+    const registered = makeRegistry({ enabled: true, mode: 'enforce', backendKind: 'openrouter', providerId: '' }, undefined)
+    const out = await registered.rpc.get('testConnection')()
+    assert.equal(out.running, false)
+    assert.match(out.statusText.en, /no decision provider/i)
+  })
+
+  it('a cloud backend without consent reports consent required (no network call)', async () => {
+    const access = providerAccessStub([OPENROUTER], async () => jevAnswer())
+    const registered = makeRegistry({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: false }, access)
+    const out = await registered.rpc.get('testConnection')()
+    assert.equal(out.running, false)
+    assert.match(out.statusText.en, /consent/i)
+  })
+
+  it('an authentication failure is reported distinctly and leaks no credentials', async () => {
+    const access = providerAccessStub([OPENROUTER], async () => {
+      throw new Error('Provider request failed with status 401')
+    })
+    const registered = makeRegistry({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true }, access)
+    const out = await registered.rpc.get('testConnection')()
+    assert.equal(out.running, false)
+    assert.match(out.statusText.en, /Authentication failed/)
+    assert.ok(!/sk-|Bearer|credential value/i.test(out.statusText.en))
+  })
+
+  it('a disabled plugin reports disabled without probing', async () => {
+    const access = providerAccessStub([OPENROUTER], async () => {
+      throw new Error('should not be called')
+    })
+    const registered = makeRegistry({ enabled: false, providerId: 'or-1', cloudConsent: true }, access)
+    const out = await registered.rpc.get('testConnection')()
+    assert.equal(out.running, false)
+    assert.match(out.statusText.en, /disabled/i)
+  })
+
+  it('a healthy probe without an operator policy flags escalation-only mode', async () => {
+    const server = loopbackServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(jevAnswer('APPROVE')))
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const port = server.address().port
+      const registered = makeRegistry({ enabled: true, mode: 'enforce', backendKind: 'local', localUrl: `http://127.0.0.1:${port}` }, undefined)
+      const out = await registered.rpc.get('testConnection')()
+      assert.equal(out.running, true)
+      assert.match(out.statusText.en, /operator policy/i)
     } finally {
       server.close()
     }

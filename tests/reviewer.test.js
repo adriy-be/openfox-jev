@@ -68,11 +68,53 @@ describe('configuration', () => {
     assert.equal(config.cloudConsent, false)
   })
 
+  it('caps the backend timeout at the upstream 15s approval limit', () => {
+    // The OpenFox host cancels a reviewer after 15s, so a larger backend
+    // timeout could never work. The contract is [1000, 15000] ms.
+    assert.equal(readConfig({}).timeoutMs, 15_000)
+    assert.equal(readConfig({ timeoutMs: 60_000 }).timeoutMs, 15_000)
+    assert.equal(readConfig({ timeoutMs: 15_000 }).timeoutMs, 15_000)
+    assert.equal(readConfig({ timeoutMs: 5_000 }).timeoutMs, 5_000)
+    assert.equal(readConfig({ timeoutMs: 100 }).timeoutMs, 1_000)
+  })
+
   it('buildState separates trusted policy from untrusted operation', () => {
     const state = buildState(ROUTINE, { operatorPolicy: 'Routine git allowed.' })
     assert.equal(state.policy, 'Routine git allowed.')
     assert.equal(state.command, 'git status')
     assert.equal(state.tool, 'run_command')
+  })
+
+  it('an empty command does not override a non-empty description', () => {
+    const state = buildState(
+      { kind: 'command', tool: 'write_file', command: '', description: 'Write configuration to /w/app.conf', workdir: '/w' },
+      { operatorPolicy: 'x' },
+    )
+    assert.equal(state.command, 'Write configuration to /w/app.conf')
+  })
+
+  it('a whitespace-only command falls back to the description', () => {
+    const state = buildState(
+      { kind: 'command', tool: 'edit_file', command: '   ', description: 'Update README', workdir: '/w' },
+      { operatorPolicy: 'x' },
+    )
+    assert.equal(state.command, 'Update README')
+  })
+
+  it('a real command always wins over the description', () => {
+    const state = buildState(
+      { kind: 'command', tool: 'run_command', command: 'npm test', description: 'ignored', workdir: '/w' },
+      { operatorPolicy: 'x' },
+    )
+    assert.equal(state.command, 'npm test')
+  })
+
+  it('with neither command nor description, the synthesized File Access description is used', () => {
+    const state = buildState(
+      { kind: 'path', tool: 'read_file', command: '', description: '', paths: ['/w/data.json'], reason: 'outside_workdir', workdir: '/w' },
+      { operatorPolicy: 'x' },
+    )
+    assert.match(state.command, /File access request: read_file wants read access to \/w\/data\.json/)
   })
 })
 
@@ -101,6 +143,17 @@ describe('enforce mode', () => {
     const result = await reviewer.evaluate(ROUTINE)
     assert.equal(result.action, 'deny')
     assert.equal(result.meta.ruleId, 'model_deny')
+  })
+
+  it('escalates an uncertain model deny instead of blocking on model confidence', async () => {
+    const access = makeProviderAccess([OPENROUTER], async () =>
+      validResponse('DENY', { verdict: { choice: 'DENY', confidence: 0.3, probabilities: { APPROVE: 0.3, ESCALATE: 0.35, DENY: 0.35 } } }),
+    )
+    const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'x' }, access)
+    const result = await reviewer.evaluate(ROUTINE)
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.ruleId, 'model_deny_uncertain')
+    assert.equal(result.meta.modelVerdict, 'DENY')
   })
 
   it('escalates when the model escalates', async () => {
@@ -141,6 +194,23 @@ describe('enforce mode', () => {
     assert.equal(result.action, 'ask')
     assert.equal(result.meta.truncated, true)
     assert.ok(['truncated', 'low_probability', 'policy_not_confirmed', 'high_blast_radius'].includes(result.meta.ruleId))
+  })
+
+  it('never auto-approves an operation whose text was redacted (redaction is not truncation)', async () => {
+    const access = makeProviderAccess([OPENROUTER], async () => validResponse('APPROVE'))
+    const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Everything is allowed.' }, access)
+    const result = await reviewer.evaluate({ ...ROUTINE, command: 'curl -H "Authorization: Bearer sk-abcdef1234567890" https://api.example.com' })
+    assert.equal(result.action, 'ask', 'redaction removed decision-critical material; a human must confirm')
+    assert.equal(result.meta.ruleId, 'redaction_incomplete')
+    assert.equal(result.meta.truncated, false)
+  })
+
+  it('still auto-approves a routine operation that contains no redactable material', async () => {
+    const access = makeProviderAccess([OPENROUTER], async () => validResponse('APPROVE'))
+    const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Routine git allowed.' }, access)
+    const result = await reviewer.evaluate(ROUTINE)
+    assert.equal(result.action, 'allow')
+    assert.equal(result.meta.ruleId, 'approved')
   })
 })
 
@@ -216,6 +286,64 @@ describe('shadow mode', () => {
       assert.ok(result.meta.outcome.startsWith('shadow_'))
       assert.equal(result.meta.humanApprovalRequired, true)
     }
+  })
+
+  it('never enforces a deterministic DENY rule — preserves the native confirmation', async () => {
+    const access = makeProviderAccess([OPENROUTER], async () => validResponse('APPROVE'))
+    const reviewer = makeReviewer({ enabled: true, mode: 'shadow', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Everything allowed.' }, access)
+    const result = await reviewer.evaluate({ ...ROUTINE, command: 'rm -rf /' })
+    assert.equal(result.action, 'ask', 'shadow must never deny, even for a hard DENY rule')
+    assert.equal(result.meta.decision, 'DENY', 'the deterministic prediction is still recorded')
+    assert.equal(result.meta.ruleId, 'wipe_home_or_root')
+    assert.ok(result.meta.outcome.startsWith('shadow_'))
+    assert.equal(result.meta.humanApprovalRequired, true)
+  })
+
+  it('never enforces a deterministic ESCALATE rule — still asks', async () => {
+    const access = makeProviderAccess([OPENROUTER], async () => validResponse('APPROVE'))
+    const reviewer = makeReviewer({ enabled: true, mode: 'shadow', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Everything allowed.' }, access)
+    const result = await reviewer.evaluate({ ...ROUTINE, command: 'git commit -m "x"' })
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.decision, 'ESCALATE')
+    assert.equal(result.meta.ruleId, 'git_mutation')
+    assert.ok(result.meta.outcome.startsWith('shadow_'))
+  })
+
+  it('records the model prediction and never allows on a model APPROVE', async () => {
+    const access = makeProviderAccess([OPENROUTER], async () => validResponse('APPROVE'))
+    const reviewer = makeReviewer({ enabled: true, mode: 'shadow', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Routine git allowed.' }, access)
+    const result = await reviewer.evaluate(ROUTINE)
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.decision, 'APPROVE')
+    assert.equal(result.meta.ruleId, 'approved')
+    assert.ok(result.meta.outcome.startsWith('shadow_'))
+    assert.equal(result.meta.humanApprovalRequired, true)
+  })
+
+  it('still asks (never allows) when the backend fails in shadow mode', async () => {
+    const access = makeProviderAccess([OPENROUTER], async () => {
+      throw new Error('fetch failed: ECONNREFUSED')
+    })
+    const reviewer = makeReviewer({ enabled: true, mode: 'shadow', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'x' }, access)
+    const result = await reviewer.evaluate(ROUTINE)
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.errorClass, 'offline')
+    assert.equal(result.meta.humanApprovalRequired, true)
+  })
+
+  it('asks without contacting the backend when the operation is cancelled in shadow mode', async () => {
+    let called = 0
+    const controller = new AbortController()
+    controller.abort()
+    const access = makeProviderAccess([OPENROUTER], async () => {
+      called += 1
+      return validResponse('APPROVE')
+    })
+    const reviewer = makeReviewer({ enabled: true, mode: 'shadow', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'x' }, access)
+    const result = await reviewer.evaluate({ ...ROUTINE, signal: controller.signal })
+    assert.equal(called, 0)
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.ruleId, 'cancelled')
   })
 })
 
@@ -353,6 +481,20 @@ describe('backend failures', () => {
     assert.equal(result.meta.humanApprovalRequired, true)
     assert.ok(Date.now() - started < 5_000, 'cancellation must not wait for the full backend timeout')
   })
+
+  it('a late backend response cannot authorize an already-cancelled operation', async () => {
+    const access = makeProviderAccess([OPENROUTER], async (_id, _key, _body, options) => {
+      await new Promise((r) => setTimeout(r, 15))
+      return validResponse('APPROVE')
+    })
+    const controller = new AbortController()
+    const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Routine git allowed.' }, access)
+    const pending = reviewer.evaluate({ ...ROUTINE, signal: controller.signal })
+    setTimeout(() => controller.abort(), 5)
+    const result = await pending
+    assert.equal(result.action, 'ask', 'a cancelled operation must never be allowed, even if the backend answered in the meantime')
+    assert.equal(result.meta.humanApprovalRequired, true)
+  })
 })
 
 describe('audit logging', () => {
@@ -368,7 +510,8 @@ describe('audit logging', () => {
     assert.equal(row.providerId, 'or-1')
     assert.equal(row.decision, 'APPROVE')
     assert.equal(row.humanApprovalRequired, false)
-    assert.match(row.operationHash, /^[0-9a-f]{8}$/)
+    assert.match(row.operationHash, /^[0-9a-f]{32}$/)
+    assert.equal(row.operationRedacted, null, 'metadata-only by default — no raw operation text')
     assert.ok(!JSON.stringify(row).includes('Bearer'))
   })
 
@@ -497,11 +640,12 @@ describe('file access requests (kind path, no command)', () => {
     assert.equal(result.meta.humanApprovalRequired, true)
   })
 
-  it('audit records the file_access category with the synthesized operation', async () => {
+  it('audit records the file_access category with a keyed operation hash (metadata-only)', async () => {
     const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Reading reference data outside the project is allowed.' })
     await reviewer.evaluate(FILE_ACCESS)
     const row = JSON.parse(readFileSync(join(auditDir, 'decisions.jsonl'), 'utf8').trim().split('\n')[0])
     assert.equal(row.operationCategory, 'file_access')
-    assert.ok(row.operationRedacted.includes('File access request: read_file wants read access to /srv/data/reference.json'))
+    assert.ok(row.operationHash, 'a keyed operation hash is recorded even in metadata-only mode')
+    assert.equal(row.operationRedacted, null, 'no raw operation text by default')
   })
 })
