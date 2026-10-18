@@ -141,20 +141,27 @@ function originalAbsPath(candidate, workdir) {
 }
 
 /**
- * Physical path resolution, mirroring how the kernel resolves a path: symlinks
- * are followed and `..` steps back from the CURRENT physical location, not the
+ * Physical path resolution, mirroring how the OS resolves a path: symlinks are
+ * followed and `..` steps back from the CURRENT physical location, not the
  * textual one. Node's realpathSync resolves `symlink/..` logically (back to the
  * symlink's own directory), which hides exactly the escape we must catch, so
  * the path is resolved component by component here instead.
+ *
+ * Handles both POSIX (/…) and Windows (X:…) roots: a drive letter is treated
+ * as the root exactly like `/`, so containment works identically on both.
  *
  * Returns the physical absolute path (deepest existing prefix plus any
  * non-existing tail), or null when the path is unresolvable (symlink loop).
  */
 export function resolvePhysicalPath(p, maxSymlinks = 40) {
-  const comps = p.split('/').filter((c) => c !== '' && c !== '.')
+  const s = p.replace(/\\/g, '/')
+  const drive = /^[a-zA-Z]:/.test(s) ? s.slice(0, 2) : null
+  let base = drive || '/'
+  const comps = (drive ? s.slice(2) : s).split('/').filter((c) => c !== '' && c !== '.')
   const stack = []
   let symlinks = 0
   let i = 0
+  const abs = () => (base === '/' ? (stack.length ? '/' + stack.join('/') : '/') : base + '/' + stack.join('/'))
   while (i < comps.length) {
     const comp = comps[i]
     if (comp === '..') {
@@ -163,27 +170,31 @@ export function resolvePhysicalPath(p, maxSymlinks = 40) {
       continue
     }
     stack.push(comp)
-    const candidate = '/' + stack.join('/')
+    const candidate = abs()
     let st
     try {
       st = lstatSync(candidate)
     } catch {
       const tail = comps.slice(i + 1).join('/')
-      return '/' + stack.join('/') + (tail ? '/' + tail : '')
+      return abs() + (tail ? '/' + tail : '')
     }
     if (st.isSymbolicLink()) {
       symlinks += 1
       if (symlinks > maxSymlinks) return null
-      const target = readlinkSync(candidate)
+      const target = readlinkSync(candidate).replace(/\\/g, '/')
       stack.pop()
-      const targetComps = target.split('/').filter((c) => c !== '' && c !== '.')
-      if (target.startsWith('/')) stack.length = 0
+      const targetDrive = /^[a-zA-Z]:/.test(target) ? target.slice(0, 2) : null
+      if (target.startsWith('/') || targetDrive) {
+        base = targetDrive || '/'
+        stack.length = 0
+      }
+      const targetComps = target.replace(/^[a-zA-Z]:/, '').split('/').filter((c) => c !== '' && c !== '.')
       comps.splice(i, 1, ...targetComps)
       continue
     }
     i += 1
   }
-  return '/' + stack.join('/')
+  return abs()
 }
 
 /**
@@ -203,9 +214,8 @@ export function isWithinProject(candidate, workdir) {
   if (candNorm !== rootNorm && !candNorm.startsWith(rootNorm + '/')) return false
   const rootReal = tryRealpath(workdir)
   if (!rootReal) return true
-  const origAbs = originalAbsPath(candidate, workdir)
-  if (!origAbs.startsWith('/')) return true
-  const candReal = resolvePhysicalPath(origAbs)
+  // Physical resolution runs for POSIX and Windows (drive-letter) roots alike.
+  const candReal = resolvePhysicalPath(originalAbsPath(candidate, workdir))
   if (candReal === null) return false
   return candReal === rootReal || candReal.startsWith(rootReal + '/')
 }

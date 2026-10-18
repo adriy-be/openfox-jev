@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from 'node:fs'
-import { redactSecrets, redactState, evaluateSecurity, hashId } from '../src/security.js'
+import { redactSecrets, redactState, evaluateSecurity, hashId, resolvePhysicalPath } from '../src/security.js'
 
 describe('secret redaction', () => {
   it('redacts bearer tokens', () => {
@@ -377,6 +377,16 @@ describe('symlink escape containment (real filesystem)', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+
+  it('physically resolves Windows drive-letter roots (no lexical early-out, no / re-root)', () => {
+    // Nothing under C:/ exists on POSIX CI, so this pins the drive-aware branch:
+    // the resolver must keep the C: root and the raw .. intact rather than
+    // re-rooting to / or bailing out before physical resolution runs.
+    const resolved = resolvePhysicalPath('C:/work/link/../secret.txt')
+    assert.ok(resolved.startsWith('C:/'), 'drive root must be preserved')
+    assert.ok(!resolved.startsWith('//') && !/^\/[^C]/.test(resolved), 'must not be re-rooted to /')
+    assert.ok(resolved.includes('..'), 'the .. must survive for the kernel to resolve')
   })
 })
 
