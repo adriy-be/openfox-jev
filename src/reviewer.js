@@ -164,6 +164,24 @@ function probeMessage(statusClass) {
 export function createReviewer({ getSettings, providerAccess, audit }) {
   const log = audit ?? createAuditLog({ enabled: true })
 
+  // In-process counters and the most recent decision/probe. Exposed through
+  // getDiagnostics() for the connectionStatus RPC — no secrets, no operation
+  // text. A fresh process (plugin reload) starts from zero, which is itself
+  // meaningful: nothing is persisted between evaluations.
+  const counters = {
+    confirmations: 0,
+    reviewer_invocations: 0,
+    skipped_before_reviewer: 0,
+    backend_requests_attempted: 0,
+    backend_requests_succeeded: 0,
+    backend_requests_failed: 0,
+    auto_approved: 0,
+    manual_escalations: 0,
+    denied: 0,
+  }
+  let lastDecision = null
+  let lastProbe = null
+
   async function assess(context, config, provider) {
     const kind = config.backendKind || (provider ? detectKind(provider) : 'local')
     const model = config.model || defaultModelFor(provider, { backendKind: kind })
@@ -234,18 +252,42 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
    * Review one confirmation request. Returns { action: 'allow'|'ask'|'deny',
    * reason?, meta } — the OpenFox host maps these to allow/ask/deny.
    */
+  function finish(action, meta) {
+    if (action === 'allow') counters.auto_approved += 1
+    else if (action === 'deny') counters.denied += 1
+    else counters.manual_escalations += 1
+    lastDecision = {
+      ts: new Date().toISOString(),
+      action,
+      decision: meta.decision ?? null,
+      ruleId: meta.ruleId ?? null,
+      outcome: meta.outcome ?? null,
+      errorClass: meta.errorClass ?? null,
+      latencyMs: meta.latencyMs ?? null,
+      model: meta.model ?? null,
+    }
+    return { action, reason: meta.reason ?? null, meta }
+  }
+
   async function evaluate(context) {
-    const config = readConfig(getSettings() ?? {})
+    counters.confirmations += 1
+    const config = readConfig(getSettings(context) ?? {})
     const operationText = resolveOperationText(context) || context.tool || ''
 
-    if (!config.enabled) return { action: 'ask', reason: 'Smart approvals disabled.', meta: { decision: 'ESCALATE', ruleId: 'disabled', humanApprovalRequired: true } }
+    if (!config.enabled) {
+      counters.skipped_before_reviewer += 1
+      const meta = { decision: 'ESCALATE', ruleId: 'disabled', outcome: 'skipped_disabled', humanApprovalRequired: true }
+      record(config, null, context, meta, operationText)
+      return finish('ask', meta)
+    }
 
     // A cancelled operation is never auto-approved: fail closed to the native
     // confirmation flow without contacting the backend.
     if (context.signal?.aborted) {
+      counters.skipped_before_reviewer += 1
       const meta = { decision: 'ESCALATE', ruleId: 'cancelled', outcome: 'escalated_cancelled', humanApprovalRequired: true, errorClass: 'cancelled' }
       record(config, null, context, meta, operationText)
-      return { action: 'ask', reason: 'Operation was cancelled; falling back to manual confirmation.', meta }
+      return finish('ask', meta)
     }
 
     // Mandatory deterministic security rules run first and are not optional.
@@ -253,54 +295,66 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
     // enforced: the native confirmation flow is always preserved.
     const security = evaluateSecurity(context)
     if (security.decision === 'DENY') {
+      counters.skipped_before_reviewer += 1
       if (config.mode === 'shadow') {
         const meta = { decision: 'DENY', ruleId: security.ruleId, outcome: 'shadow_deny', humanApprovalRequired: true, modelVerdict: null, confidence: 0, approvalProbability: 0 }
         record(config, null, context, meta, operationText)
-        return { action: 'ask', reason: `Shadow mode: predicted DENY (${security.reason}) — native approval flow preserved.`, meta }
+        return finish('ask', meta)
       }
       const meta = { decision: 'DENY', ruleId: security.ruleId, outcome: 'denied', humanApprovalRequired: false, modelVerdict: null, confidence: 0, approvalProbability: 0 }
       record(config, null, context, meta, operationText)
-      return { action: 'deny', reason: security.reason, meta }
+      return finish('deny', { ...meta, reason: security.reason })
     }
     if (security.decision === 'ESCALATE') {
+      counters.skipped_before_reviewer += 1
       const shadow = config.mode === 'shadow'
       const meta = { decision: 'ESCALATE', ruleId: security.ruleId, outcome: shadow ? 'shadow_escalate' : 'escalated_mandatory', humanApprovalRequired: true, modelVerdict: null, confidence: 0, approvalProbability: 0 }
       record(config, null, context, meta, operationText)
-      return { action: 'ask', reason: shadow ? `Shadow mode: predicted ESCALATE (${security.reason}) — native approval flow preserved.` : security.reason, meta }
+      return finish('ask', meta)
     }
 
     const provider = config.providerId && providerAccess ? providerAccess.getProvider(config.providerId) : undefined
     const kind = config.backendKind || (provider ? detectKind(provider) : null)
 
     if (config.providerId && !provider) {
+      counters.skipped_before_reviewer += 1
       const meta = { decision: 'ESCALATE', ruleId: 'provider_unavailable', outcome: 'escalated_provider_missing', humanApprovalRequired: true, errorClass: 'provider_unavailable' }
       record(config, null, context, meta, operationText)
-      return { action: 'ask', reason: 'Selected provider is missing or was removed from the Provider Manager.', meta }
+      return finish('ask', meta)
     }
     if (!kind) {
-      return escalate(config, undefined, context, 'no_provider', 'No decision backend configured.', { outcome: 'escalated_no_provider' })
+      counters.skipped_before_reviewer += 1
+      const meta = { decision: 'ESCALATE', ruleId: 'no_provider', outcome: 'escalated_no_provider', humanApprovalRequired: true, errorClass: 'no_provider' }
+      record(config, undefined, context, meta, operationText)
+      return finish('ask', { ...meta, reason: 'No decision backend configured.' })
     }
     if (kind !== 'local' && !provider) {
+      counters.skipped_before_reviewer += 1
       const meta = { decision: 'ESCALATE', ruleId: 'provider_unavailable', outcome: 'escalated_provider_missing', humanApprovalRequired: true, errorClass: 'provider_unavailable' }
       record(config, null, context, meta, operationText)
-      return { action: 'ask', reason: 'Selected provider is missing or was removed from the Provider Manager.', meta }
+      return finish('ask', meta)
     }
     if (provider && isRemoteBackend(provider, { backendKind: config.backendKind || undefined }) && !config.cloudConsent) {
+      counters.skipped_before_reviewer += 1
       const meta = { decision: 'ESCALATE', ruleId: 'privacy_consent', outcome: 'escalated_no_consent', humanApprovalRequired: true }
       record(config, provider, context, meta, operationText)
-      return { action: 'ask', reason: 'Cloud inference for approval data is not permitted (privacy consent required).', meta }
+      return finish('ask', meta)
     }
 
+    counters.reviewer_invocations += 1
+    counters.backend_requests_attempted += 1
     let assessment
     try {
       assessment = await assess(context, config, provider)
     } catch (error) {
+      counters.backend_requests_failed += 1
       const meta = { decision: 'ESCALATE', ruleId: 'backend_error', outcome: 'escalated_error', humanApprovalRequired: true, errorClass: 'unknown' }
       record(config, provider, context, meta, operationText)
-      return { action: 'ask', reason: 'Decision backend failed; falling back to manual confirmation.', meta }
+      return finish('ask', meta)
     }
 
     if (!assessment.ok) {
+      counters.backend_requests_failed += 1
       const ruleId =
         assessment.errorClass === 'invalid_response' ? 'invalid_response' : assessment.errorClass === 'cancelled' ? 'cancelled' : 'backend_error'
       const meta = {
@@ -314,15 +368,16 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
         truncated: assessment.truncated,
       }
       record(config, provider, context, meta, operationText)
-      return { action: 'ask', reason: 'Decision backend returned no usable assessment.', meta }
+      return finish('ask', meta)
     }
+    counters.backend_requests_succeeded += 1
 
     // A late response cannot authorize an operation that was cancelled while
     // we waited: re-check the signal after the backend round-trip.
     if (context.signal?.aborted) {
       const meta = { decision: 'ESCALATE', ruleId: 'cancelled', outcome: 'escalated_cancelled', humanApprovalRequired: true, errorClass: 'cancelled', latencyMs: assessment.latencyMs, model: assessment.model }
       record(config, provider, context, meta, operationText)
-      return { action: 'ask', reason: 'Operation was cancelled; falling back to manual confirmation.', meta }
+      return finish('ask', meta)
     }
 
     const verdictEntry = assessment.answers.verdict
@@ -362,14 +417,14 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
       meta.outcome = `shadow_${policy.decision.toLowerCase()}`
       meta.humanApprovalRequired = true
       record(config, provider, context, meta, operationText)
-      return { action: 'ask', reason: 'Shadow mode: prediction recorded, native approval flow preserved.', meta }
+      return finish('ask', meta)
     }
 
     record(config, provider, context, meta, operationText)
 
-    if (policy.decision === 'APPROVE') return { action: 'allow', reason: policy.reason, meta }
-    if (policy.decision === 'DENY') return { action: 'deny', reason: policy.reason, meta }
-    return { action: 'ask', reason: policy.reason, meta }
+    if (policy.decision === 'APPROVE') return finish('allow', { ...meta, reason: policy.reason })
+    if (policy.decision === 'DENY') return finish('deny', { ...meta, reason: policy.reason })
+    return finish('ask', { ...meta, reason: policy.reason })
   }
 
   /**
@@ -380,7 +435,7 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
    * statusClass ∈ 'success' | 'disabled' | 'provider_missing' | 'consent_required'
    *               | 'timeout' | 'auth' | 'invalid_schema' | 'unreachable' | 'error'
    */
-  async function testConnection() {
+  async function runProbe() {
     const config = readConfig(getSettings() ?? {})
     if (!config.enabled) {
       return { ok: false, statusClass: 'disabled', message: 'Smart approvals are disabled.', latencyMs: null }
@@ -413,5 +468,20 @@ export function createReviewer({ getSettings, providerAccess, audit }) {
     return { ok: false, statusClass, message: probeMessage(statusClass), latencyMs: result.latencyMs }
   }
 
-  return { evaluate, testConnection, questions: QUESTIONS, defaultModel: CLIENT_DEFAULT_MODEL }
+  async function testConnection() {
+    const probe = await runProbe()
+    lastProbe = { ...probe, at: Date.now() }
+    return probe
+  }
+
+  /**
+   * Diagnostic snapshot for the connectionStatus RPC. Counters are
+   * process-lifetime aggregates; lastDecision/lastProbe carry status classes,
+   * latencies and timestamps — never credentials or operation text.
+   */
+  function getDiagnostics() {
+    return { counters: { ...counters }, lastDecision, lastProbe }
+  }
+
+  return { evaluate, testConnection, getDiagnostics, questions: QUESTIONS, defaultModel: CLIENT_DEFAULT_MODEL }
 }

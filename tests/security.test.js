@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from 'node:fs'
-import { redactSecrets, redactState, evaluateSecurity, hashId, resolvePhysicalPath } from '../src/security.js'
+import { redactSecrets, redactState, evaluateSecurity, hashId, resolvePhysicalPath, firstGitInvocation, allGitInvocations } from '../src/security.js'
 
 describe('secret redaction', () => {
   it('redacts bearer tokens', () => {
@@ -132,12 +132,106 @@ describe('mandatory security rules', () => {
     assert.equal(evaluateSecurity({ command: 'git log --oneline -10' }).decision, null)
   })
 
-  it('escalates state-changing git operations', () => {
-    const r = evaluateSecurity({ command: 'git commit -m "x"' })
-    assert.equal(r.decision, 'ESCALATE')
-    assert.equal(r.ruleId, 'git_mutation')
-    assert.equal(evaluateSecurity({ command: 'git push origin feature' }).ruleId, 'git_mutation')
-    assert.equal(evaluateSecurity({ command: 'git checkout dev' }).ruleId, 'git_mutation')
+  it('escalates high-blast-radius git operations by argument, not by name', () => {
+    for (const command of [
+      'git push origin feature',
+      'git push',
+      'git reset --hard HEAD~1',
+      'git reset -H',
+      'git clean -f',
+      'git clean -fdx',
+      'git fetch --prune',
+      'git fetch -p',
+      'git rm src/old.js',
+      'git add -A',
+      'git add --all',
+      'git add .',
+      'git add',
+      'git add -u',
+      'git mv a.js b.js',
+      'git am patch.msg',
+      'git pull origin main',
+      'git restore src/a.js',
+    ]) {
+      const r = evaluateSecurity({ command })
+      assert.equal(r.decision, 'ESCALATE', `${command} must escalate`)
+      assert.equal(r.ruleId, 'git_mutation', `${command} must escalate via git_mutation`)
+    }
+  })
+
+  it('escalates compound git commands when ANY part is high-blast-radius', () => {
+    for (const command of [
+      'git fetch && git push origin main',
+      'git add src/x.js && git push',
+      'git status; git reset --hard HEAD~1',
+      'git log && git clean -fdx',
+      'git diff || git rm src/old.js',
+      'echo hi && git fetch --prune',
+    ]) {
+      const r = evaluateSecurity({ command })
+      assert.equal(r.decision, 'ESCALATE', `${command} must escalate via its dangerous part`)
+      assert.equal(r.ruleId, 'git_mutation', `${command} must escalate via git_mutation`)
+    }
+  })
+
+  it('escalates a quoted git subcommand (git "push" is still push)', () => {
+    for (const command of ['git "push" origin main', "git 'reset' --hard HEAD~1"]) {
+      const r = evaluateSecurity({ command })
+      assert.equal(r.decision, 'ESCALATE', `${command} must not hide behind quotes`)
+      assert.equal(r.ruleId, 'git_mutation')
+    }
+  })
+
+  it('escalates uppercase combined short flags (git treats -F as --force)', () => {
+    for (const command of ['git clean -F', 'git clean -Fx', 'git clean -xF', 'git fetch -P']) {
+      const r = evaluateSecurity({ command })
+      assert.equal(r.decision, 'ESCALATE', `${command} must escalate`)
+      assert.equal(r.ruleId, 'git_mutation')
+    }
+  })
+
+  it('collects every git invocation in a compound command', () => {
+    assert.deepEqual(allGitInvocations('git status && git push origin main'), [
+      { subcommand: 'status', args: [] },
+      { subcommand: 'push', args: ['origin', 'main'] },
+    ])
+    assert.deepEqual(allGitInvocations('git fetch'), [{ subcommand: 'fetch', args: [] }])
+    assert.deepEqual(allGitInvocations('npm run build'), [])
+  })
+
+  it('leaves model-eligible git operations to the model (no rule)', () => {
+    for (const command of [
+      'git commit -m "fix: x"',
+      'git checkout dev',
+      'git switch -c feature',
+      'git merge origin/main',
+      'git rebase develop',
+      'git cherry-pick abc1234',
+      'git revert HEAD',
+      'git stash push -m "wip"',
+      'git branch feature-x',
+      'git tag v1.0.0',
+      'git fetch origin',
+      'git clean -n',
+      'git reset --soft HEAD~1',
+      'git reset HEAD~1',
+      'git add src/foo.js',
+      'git add src/ tests/',
+      'git status',
+      'git log --oneline -5',
+      'git diff',
+    ]) {
+      assert.equal(evaluateSecurity({ command }).decision, null, `${command} must not be blocked by a rule`)
+    }
+  })
+
+  it('parses git invocations with global options, paths and compound commands', () => {
+    assert.deepEqual(firstGitInvocation('git -C /repo commit -m "x"'), { subcommand: 'commit', args: ['-m', '"x"'] })
+    assert.deepEqual(firstGitInvocation('/usr/bin/git --git-dir=/g status'), { subcommand: 'status', args: [] })
+    assert.deepEqual(firstGitInvocation('cd /x && git push origin main'), { subcommand: 'push', args: ['origin', 'main'] })
+    assert.deepEqual(firstGitInvocation('echo "git push" && git status'), { subcommand: 'status', args: [] })
+    assert.equal(firstGitInvocation('npm run build'), null)
+    assert.equal(firstGitInvocation('echo git'), null)
   })
 
   it('escalates writes outside the project', () => {

@@ -36,7 +36,7 @@ function jevAnswer(choice = 'APPROVE') {
 
 let auditDir
 
-function makeRegistry(settings, providerAccess) {
+function makeRegistry(settings, providerAccess, projectSettings) {
   const registered = { settings: null, reviewers: [], rpc: new Map() }
   const registry = {
     context: {
@@ -45,7 +45,8 @@ function makeRegistry(settings, providerAccess) {
       runtime: { mode: 'test', configDirectory: auditDir },
       logger: { debug() {}, info() {}, warn() {}, error() {} },
       storage: { get: () => undefined, set() {} },
-      settings: (scope) => (scope === 'project' ? {} : settings),
+      settings: (scope, projectId, options) =>
+        scope === 'project' && projectId ? (options?.onlyStored ? (projectSettings ?? {}) : {}) : settings,
       notify() {},
       publish() {},
       ...(providerAccess ? { providerAccess } : {}),
@@ -274,16 +275,24 @@ describe('end-to-end approval lifecycle (mocked provider)', () => {
     assert.deepEqual(results.map((r) => r.action), ['allow', 'deny', 'allow'])
   })
 
-  it('connection status RPC reports provider, model and mode', async () => {
+  it('connection status reports provider, model and mode but is not "running" before a probe', async () => {
     const registered = makeRegistry(
       { enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, model: 'nace-ai/drex-v2.0' },
       providerAccessStub([OPENROUTER], async () => jevAnswer()),
     )
     const status = await registered.rpc.get('connectionStatus')()
-    assert.equal(status.running, true)
+    assert.equal(status.running, false)
     assert.match(status.statusText.en, /OpenRouter/)
     assert.match(status.statusText.en, /nace-ai\/drex-v2\.0/)
     assert.match(status.statusText.en, /enforce/)
+    assert.match(status.statusText.en, /not tested/)
+
+    const probe = await registered.rpc.get('testConnection')()
+    assert.equal(probe.running, true)
+    const verified = await registered.rpc.get('connectionStatus')()
+    assert.equal(verified.running, true)
+    assert.match(verified.statusText.en, /verified/)
+    assert.match(verified.statusText.en, /\d+ ms, \d+s ago/)
   })
 
   it('connection status warns when cloud consent is missing', async () => {
@@ -294,6 +303,33 @@ describe('end-to-end approval lifecycle (mocked provider)', () => {
     const status = await registered.rpc.get('connectionStatus')()
     assert.equal(status.running, false)
     assert.match(status.statusText.en, /consent/i)
+  })
+
+  it('connection status exposes in-process counters and the last decision (no secrets)', async () => {
+    const registered = makeRegistry(
+      { enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Routine git allowed.' },
+      providerAccessStub([OPENROUTER], async () => jevAnswer('APPROVE')),
+    )
+    const reviewer = registered.reviewers[0]
+    await reviewer.evaluate(ROUTINE) // allow
+    await reviewer.evaluate({ ...ROUTINE, command: 'rm -rf /' }) // mandatory deny
+
+    const status = await registered.rpc.get('connectionStatus')()
+    assert.ok(status.diagnostics, 'connectionStatus must carry the diagnostic snapshot')
+    assert.deepEqual(status.diagnostics.counters, {
+      confirmations: 2,
+      reviewer_invocations: 1,
+      skipped_before_reviewer: 1,
+      backend_requests_attempted: 1,
+      backend_requests_succeeded: 1,
+      backend_requests_failed: 0,
+      auto_approved: 1,
+      manual_escalations: 0,
+      denied: 1,
+    })
+    assert.equal(status.diagnostics.lastDecision.action, 'deny')
+    assert.equal(status.diagnostics.lastDecision.ruleId, 'wipe_home_or_root')
+    assert.ok(!JSON.stringify(status.diagnostics).includes('rm -rf /'), 'diagnostics must not carry operation text')
   })
 })
 
@@ -635,6 +671,436 @@ describe('File Access (folder access) end-to-end', () => {
       assert.equal(result.action, 'allow')
       assert.equal(received.length, 1)
       assert.ok(received[0].state.includes('File access request: read_file wants read access to /srv/git/other-project'))
+    } finally {
+      server.close()
+    }
+  })
+})
+
+describe('15-row regression matrix (mocked DeepInfra decisions endpoint)', () => {
+  let server
+  let port
+  let hits
+  let respondWith
+  let delayMs
+  let statusToReturn
+
+  function fakeAnswer(overrides = {}) {
+    return {
+      model: 'nace-ai/drex-v2.0',
+      answers: {
+        verdict: {
+          type: 'choice',
+          choice: 'APPROVE',
+          confidence: 0.9,
+          probabilities: { APPROVE: 0.9, ESCALATE: 0.07, DENY: 0.03 },
+        },
+        destructive: { type: 'noul', noul: 0.05 },
+        reads_secrets: { type: 'noul', noul: 0.02 },
+        exfiltration: { type: 'noul', noul: 0.01 },
+        self_advocating: { type: 'noul', noul: 0.01 },
+        policy_allows: { type: 'noul', noul: 0.95 },
+        blast_radius: { type: 'score', score: 0.4 },
+        ...overrides,
+      },
+      usage: { input_tokens: 120, output_tokens: 0 },
+      latency_ms: 3,
+    }
+  }
+
+  before(async () => {
+    hits = []
+    respondWith = () => ({ status: 200, body: fakeAnswer() })
+    delayMs = 0
+    statusToReturn = 200
+    mockDeepInfra = { id: 'di-mock', name: 'DeepInfra (mock)', url: 'https://api.deepinfra.com/v1/openai', backend: 'openai', isActive: false, hasCredential: true }
+    server = createServer((req, res) => {
+      let body = ''
+      req.on('data', (chunk) => {
+        body += chunk
+      })
+      req.on('end', () => {
+        if (req.url !== '/v1/decisions' || req.method !== 'POST') {
+          res.writeHead(404)
+          res.end()
+          return
+        }
+        hits.push(JSON.parse(body))
+        setTimeout(() => {
+          const { status, body: out } = respondWith(JSON.parse(body))
+          res.writeHead(status, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(out))
+        }, delayMs)
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    port = server.address().port
+  })
+
+  after(() => {
+    server.close()
+  })
+
+  beforeEach(() => {
+    hits.length = 0
+    delayMs = 0
+    statusToReturn = 200
+    respondWith = () => ({ status: 200, body: fakeAnswer() })
+  })
+
+  let mockDeepInfra
+  function CUSTOM() {
+    return {
+      enabled: true,
+      mode: 'enforce',
+      backendKind: 'custom',
+      customEndpoint: `http://127.0.0.1:${port}/v1/decisions`,
+      providerId: 'di-mock',
+      cloudConsent: true,
+      operatorPolicy: 'Routine read-only git commands are allowed.',
+    }
+  }
+
+  function customReviewer(settings) {
+    const access = providerAccessStub([mockDeepInfra], async () => fakeAnswer())
+    return makeRegistry({ ...CUSTOM(), ...settings }, access).reviewers[0]
+  }
+
+  it('row 1 — disabled plugin: ask, backend never called, audit ruleId disabled', async () => {
+    const reviewer = customReviewer({ enabled: false })
+    const result = await reviewer.evaluate(ROUTINE)
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.ruleId, 'disabled')
+    assert.equal(result.meta.outcome, 'skipped_disabled')
+    assert.equal(hits.length, 0)
+  })
+
+  it('row 2 — unregistered reviewer: register() survives a missing reviewer slot, host keeps native confirmations', () => {
+    const registry = {
+      context: {
+        id: 'openfox-jev',
+        version: '1.0.0',
+        runtime: { mode: 'test', configDirectory: join(tmpdir()) },
+        logger: { debug() {}, info() {}, warn() {}, error() {} },
+        storage: { get: () => undefined, set() {} },
+        settings: () => ({ enabled: true }),
+        notify() {},
+        publish() {},
+      },
+      registerSettings() {},
+      // registerApprovalReviewer intentionally absent — the host never offered the slot.
+      registerRpc() {},
+    }
+    assert.doesNotThrow(() => register(registry))
+  })
+
+  it('row 3 — shadow mode: model approves, outcome still asks (shadow_approve), one backend call', async () => {
+    const reviewer = customReviewer({ mode: 'shadow' })
+    const result = await reviewer.evaluate(ROUTINE)
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.outcome, 'shadow_approve')
+    assert.equal(hits.length, 1)
+  })
+
+  it('row 4 — enforce mode: confident approval of a routine operation auto-allows', async () => {
+    const reviewer = customReviewer({})
+    const result = await reviewer.evaluate(ROUTINE)
+    assert.equal(result.action, 'allow')
+    assert.equal(hits.length, 1)
+    assert.equal(hits[0].model, 'nace-ai/drex-v2.0')
+    assert.ok(hits[0].state.includes('git status'))
+  })
+
+  it('row 5 — remote backend without cloud consent: ask before any network call', async () => {
+    const reviewer = customReviewer({ cloudConsent: false })
+    const result = await reviewer.evaluate(ROUTINE)
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.ruleId, 'privacy_consent')
+    assert.equal(hits.length, 0)
+  })
+
+  it('row 6 — missing provider or missing credential: ask, never allow', async () => {
+    const registered = makeRegistry({ enabled: true, mode: 'enforce', providerId: 'does-not-exist', cloudConsent: true, operatorPolicy: 'x' }, undefined)
+    const result = await registered.reviewers[0].evaluate(ROUTINE)
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.ruleId, 'provider_unavailable')
+
+    const deepInfra = { id: 'di-1', name: 'DeepInfra', url: 'https://api.deepinfra.com/v1/openai', backend: 'openai', isActive: false, hasCredential: false }
+    const access = providerAccessStub([deepInfra], async () => {
+      throw new Error('no configured credentials for provider di-1')
+    })
+    const registered2 = makeRegistry({ enabled: true, mode: 'enforce', providerId: 'di-1', backendKind: 'deepinfra', cloudConsent: true, operatorPolicy: 'x' }, access)
+    const result2 = await registered2.reviewers[0].evaluate(ROUTINE)
+    assert.equal(result2.action, 'ask')
+    assert.equal(result2.meta.errorClass, 'provider_unavailable')
+  })
+
+  it('row 7 — authentication failure (401 and 403): ask, never allow', async () => {
+    for (const status of [401, 403]) {
+      respondWith = () => ({ status, body: { error: 'invalid api key' } })
+      const reviewer = customReviewer({})
+      const result = await reviewer.evaluate(ROUTINE)
+      assert.equal(result.action, 'ask')
+      assert.equal(result.meta.errorClass, 'auth')
+      assert.equal(result.meta.outcome, 'escalated_auth')
+    }
+    assert.equal(hits.length, 2)
+  })
+
+  it('row 8 — invalid System One schema: ask, never allow', async () => {
+    respondWith = () => ({ status: 200, body: { choices: [{ message: 'APPROVE' }] } })
+    const reviewer = customReviewer({})
+    const result = await reviewer.evaluate(ROUTINE)
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.errorClass, 'invalid_response')
+    assert.equal(result.meta.ruleId, 'invalid_response')
+  })
+
+  it('row 9 — confident approve (probability 0.95, blast radius 0): allowed and audited as APPROVE', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jev-row9-'))
+    try {
+      respondWith = () => ({
+        status: 200,
+        body: fakeAnswer({
+          verdict: { type: 'choice', choice: 'APPROVE', confidence: 0.95, probabilities: { APPROVE: 0.95, ESCALATE: 0.04, DENY: 0.01 } },
+          blast_radius: { type: 'score', score: 0 },
+        }),
+      })
+      const audit = createAuditLog({ filePath: join(dir, 'd.jsonl') })
+      const { createReviewer } = await import('../src/reviewer.js')
+      const reviewer = createReviewer({
+        getSettings: () => ({ ...CUSTOM() }),
+        providerAccess: providerAccessStub([mockDeepInfra], async () => fakeAnswer()),
+        audit,
+      })
+      const result = await reviewer.evaluate(ROUTINE)
+      assert.equal(result.action, 'allow')
+      assert.equal(result.meta.ruleId, 'approved')
+      const rows = readFileSync(join(dir, 'd.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+      assert.equal(rows.length, 1)
+      assert.equal(rows[0].decision, 'APPROVE')
+      assert.equal(rows[0].ruleId, 'approved')
+      assert.equal(rows[0].humanApprovalRequired, false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('row 10 — uncertain verdict (approval probability below threshold): ask', async () => {
+    respondWith = () => ({
+      status: 200,
+      body: fakeAnswer({ verdict: { type: 'choice', choice: 'APPROVE', confidence: 0.9, probabilities: { APPROVE: 0.5, ESCALATE: 0.3, DENY: 0.2 } } }),
+    })
+    const reviewer = customReviewer({})
+    const result = await reviewer.evaluate(ROUTINE)
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.ruleId, 'low_probability')
+  })
+
+  it('row 11 — mandatory security rule: rm -rf / denied before the model, zero backend calls', async () => {
+    const reviewer = customReviewer({})
+    const result = await reviewer.evaluate({ ...ROUTINE, command: 'rm -rf /' })
+    assert.equal(result.action, 'deny')
+    assert.equal(result.meta.ruleId, 'wipe_home_or_root')
+    assert.equal(hits.length, 0)
+  })
+
+  it('row 12 — force push: escalated before the model, zero backend calls', async () => {
+    const reviewer = customReviewer({})
+    const result = await reviewer.evaluate({ ...ROUTINE, command: 'git push --force origin feature' })
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.ruleId, 'force_push')
+    assert.equal(hits.length, 0)
+    const protectedResult = await reviewer.evaluate({ ...ROUTINE, command: 'git push --force origin main' })
+    assert.equal(protectedResult.action, 'deny')
+    assert.equal(protectedResult.meta.ruleId, 'force_push_protected')
+    assert.equal(hits.length, 0)
+  })
+
+  it('row 13 — backend timeout: safe escalation, never allow', async () => {
+    delayMs = 2_000
+    const reviewer = customReviewer({ timeoutMs: 60 })
+    const result = await reviewer.evaluate(ROUTINE)
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.errorClass, 'timeout')
+    assert.equal(result.meta.outcome, 'escalated_timeout')
+  })
+
+  it('row 14 — cancelled before the request: ask, zero backend calls', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const reviewer = customReviewer({})
+    const result = await reviewer.evaluate({ ...ROUTINE, signal: controller.signal })
+    assert.equal(result.action, 'ask')
+    assert.equal(result.meta.errorClass, 'cancelled')
+    assert.equal(result.meta.ruleId, 'cancelled')
+    assert.equal(hits.length, 0)
+  })
+
+  it('row 15 — plugin reload: fresh process state, counters reset, one-time approval preserved', async () => {
+    const { createReviewer } = await import('../src/reviewer.js')
+    const access = providerAccessStub([mockDeepInfra], async () => fakeAnswer())
+    const before = createReviewer({ getSettings: () => ({ ...CUSTOM() }), providerAccess: access })
+    await before.evaluate(ROUTINE)
+    assert.equal(before.getDiagnostics().counters.auto_approved, 1)
+
+    const after = createReviewer({ getSettings: () => ({ ...CUSTOM() }), providerAccess: access })
+    assert.deepEqual(after.getDiagnostics().counters, {
+      confirmations: 0,
+      reviewer_invocations: 0,
+      skipped_before_reviewer: 0,
+      backend_requests_attempted: 0,
+      backend_requests_succeeded: 0,
+      backend_requests_failed: 0,
+      auto_approved: 0,
+      manual_escalations: 0,
+      denied: 0,
+    })
+    const result = await after.evaluate(ROUTINE)
+    assert.equal(result.action, 'allow', 'reload must not remember or block a previously approved operation')
+    assert.equal(after.getDiagnostics().counters.auto_approved, 1, 'counters must not persist across reloads')
+  })
+})
+
+describe('diagnostics counters and audit completeness', () => {
+  it('counters track every outcome class and never leak operation text', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jev-counters-'))
+    try {
+      let responder = async () => jevAnswer('APPROVE')
+      const audit = createAuditLog({ filePath: join(dir, 'd.jsonl') })
+      const { createReviewer } = await import('../src/reviewer.js')
+      const reviewer = createReviewer({
+        getSettings: () => ({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Routine git allowed.' }),
+        providerAccess: providerAccessStub([OPENROUTER], (...args) => responder(...args)),
+        audit,
+      })
+
+      await reviewer.evaluate(ROUTINE)
+      responder = async () => {
+        throw new Error('fetch failed: ECONNREFUSED 127.0.0.1:8765')
+      }
+      await reviewer.evaluate(ROUTINE)
+      responder = async () => {
+        throw new Error('Provider request failed with status 401')
+      }
+      await reviewer.evaluate(ROUTINE)
+      await reviewer.evaluate({ ...ROUTINE, command: 'rm -rf /' })
+
+      const { counters, lastDecision } = reviewer.getDiagnostics()
+      assert.deepEqual(counters, {
+        confirmations: 4,
+        reviewer_invocations: 3,
+        skipped_before_reviewer: 1,
+        backend_requests_attempted: 3,
+        backend_requests_succeeded: 1,
+        backend_requests_failed: 2,
+        auto_approved: 1,
+        manual_escalations: 2,
+        denied: 1,
+      })
+      assert.equal(lastDecision.action, 'deny')
+      assert.equal(lastDecision.ruleId, 'wipe_home_or_root')
+      const snapshot = JSON.stringify(reviewer.getDiagnostics())
+      assert.ok(!snapshot.includes('rm -rf /'), 'diagnostics must not carry operation text')
+      assert.ok(!snapshot.includes('sk-'), 'diagnostics must not carry credentials')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('disabled and no_provider early exits are audited with stable ruleIds', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jev-audit-early-'))
+    try {
+      const audit = createAuditLog({ filePath: join(dir, 'd.jsonl') })
+      const { createReviewer } = await import('../src/reviewer.js')
+      const disabled = createReviewer({ getSettings: () => ({ enabled: false }), providerAccess: providerAccessStub([OPENROUTER], async () => jevAnswer()), audit })
+      await disabled.evaluate(ROUTINE)
+      const noProvider = createReviewer({
+        getSettings: () => ({ enabled: true, mode: 'enforce' }),
+        providerAccess: providerAccessStub([OPENROUTER], async () => jevAnswer()),
+        audit,
+      })
+      await noProvider.evaluate(ROUTINE)
+      const rows = readFileSync(join(dir, 'd.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+      assert.equal(rows.length, 2)
+      assert.equal(rows[0].ruleId, 'disabled')
+      assert.equal(rows[0].outcome, 'skipped_disabled')
+      assert.equal(rows[1].ruleId, 'no_provider')
+      assert.equal(rows[1].outcome, 'escalated_no_provider')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('project settings resolution (onlyStored merge)', () => {
+  function captureLocalServer() {
+    const received = []
+    const server = createServer((req, res) => {
+      let body = ''
+      req.on('data', (chunk) => {
+        body += chunk
+      })
+      req.on('end', () => {
+        if (req.url === '/v1/systemone' && req.method === 'POST') {
+          received.push(JSON.parse(body))
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(jevAnswer('APPROVE')))
+          return
+        }
+        res.writeHead(404)
+        res.end()
+      })
+    })
+    return { server, received }
+  }
+
+  it('a stored project override wins over the stored global value', async () => {
+    const { server, received } = captureLocalServer()
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const registered = makeRegistry(
+        { enabled: true, mode: 'enforce', backendKind: 'local', localUrl: `http://127.0.0.1:${server.address().port}`, operatorPolicy: 'GLOBAL POLICY A' },
+        undefined,
+        { operatorPolicy: 'PROJECT POLICY B' },
+      )
+      await registered.reviewers[0].evaluate({ ...ROUTINE, projectId: 'proj-1' })
+      assert.equal(received.length, 1)
+      assert.ok(received[0].state.includes('PROJECT POLICY B'))
+      assert.ok(!received[0].state.includes('GLOBAL POLICY A'))
+    } finally {
+      server.close()
+    }
+  })
+
+  it('an unset project key does not clobber the stored global with a schema default', async () => {
+    const { server, received } = captureLocalServer()
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const registered = makeRegistry(
+        { enabled: true, mode: 'enforce', backendKind: 'local', localUrl: `http://127.0.0.1:${server.address().port}`, operatorPolicy: 'GLOBAL POLICY A' },
+        undefined,
+        { mode: 'shadow' },
+      )
+      await registered.reviewers[0].evaluate({ ...ROUTINE, projectId: 'proj-1' })
+      assert.ok(received[0].state.includes('GLOBAL POLICY A'), 'stored global must survive an unset project key')
+    } finally {
+      server.close()
+    }
+  })
+
+  it('without a projectId the project scope is never consulted', async () => {
+    const { server, received } = captureLocalServer()
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const registered = makeRegistry(
+        { enabled: true, mode: 'enforce', backendKind: 'local', localUrl: `http://127.0.0.1:${server.address().port}`, operatorPolicy: 'GLOBAL POLICY A' },
+        undefined,
+        { operatorPolicy: 'PROJECT POLICY B' },
+      )
+      await registered.reviewers[0].evaluate(ROUTINE)
+      assert.ok(received[0].state.includes('GLOBAL POLICY A'))
+      assert.ok(!received[0].state.includes('PROJECT POLICY B'))
     } finally {
       server.close()
     }

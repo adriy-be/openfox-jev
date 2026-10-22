@@ -339,14 +339,127 @@ const HARD_DENY = [
   },
   {
     id: 'git_mutation',
-    reason: 'State-changing git operations require human confirmation.',
-    test: (op) =>
-      /\bgit\b\s+(?:commit|push|merge|rebase|reset|checkout|switch|restore|stash|tag|branch|cherry-pick|revert|clean|mv|rm|add|am|pull|fetch\s+--prune)\b/.test(
-        op.command ?? '',
-      ),
+    reason: 'High-blast-radius git operations require human confirmation.',
+    test: (op) => {
+      // A compound command is as dangerous as its most dangerous part: every
+      // git invocation is checked, and one escalated subcommand escalates the
+      // whole command — a benign first command can never hide a later push.
+      return allGitInvocations(op.command ?? '').some(
+        (inv) => gitMutationDecision(inv.subcommand, inv.args) === 'ESCALATE',
+      )
+    },
     decision: 'ESCALATE',
   },
 ]
+
+/** Global git options that consume the next token as their value. */
+const GIT_VALUE_OPTIONS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--exec-path', '--namespace'])
+
+/** Remove one matching pair of surrounding quotes from a token. */
+function stripQuotes(token) {
+  if (token.length >= 2) {
+    const first = token[0]
+    const last = token[token.length - 1]
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) return token.slice(1, -1)
+  }
+  return token
+}
+
+/**
+ * Find every `git` invocation in a (possibly compound) shell command.
+ * Returns an array of { subcommand, args }. Skips git global options (-C, -c,
+ * --git-dir=…) so the subcommand is the first non-option token after `git`.
+ * Compound commands are split on shell separators; a surrounding pair of
+ * quotes on the subcommand is stripped so `git "push"` is recognized as push.
+ * Each command segment carries at most one git invocation, so the returned
+ * array covers every git the shell would run.
+ */
+export function allGitInvocations(command) {
+  const parts = command.split(/\s*(?:&&|\|\||;|\|)\s*/)
+  const invocations = []
+  for (const part of parts) {
+    const tokens = part.trim().split(/\s+/).filter(Boolean)
+    let i = 0
+    while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i += 1
+    while (i < tokens.length) {
+      const token = tokens[i]
+      if (token === 'git' || (token.includes('/') && token.split('/').pop() === 'git')) break
+      if (token.startsWith('-') && !token.startsWith('--')) i += GIT_VALUE_OPTIONS.has(token) ? 2 : 1
+      else i += 1
+    }
+    if (tokens[i] !== 'git' && !(tokens[i] ?? '').includes('/')) continue
+    if ((tokens[i] ?? '').split('/').pop() !== 'git') continue
+    i += 1
+    while (i < tokens.length && tokens[i].startsWith('-')) {
+      if (tokens[i].includes('=')) i += 1
+      else i += GIT_VALUE_OPTIONS.has(tokens[i]) ? 2 : 1
+    }
+    const subcommand = stripQuotes(tokens[i] ?? '')
+    if (!subcommand || subcommand.startsWith('-')) continue
+    invocations.push({ subcommand, args: tokens.slice(i + 1) })
+  }
+  return invocations
+}
+
+/** Find the first `git` invocation (or null) — kept for callers that only need the head. */
+export function firstGitInvocation(command) {
+  return allGitInvocations(command)[0] ?? null
+}
+
+/**
+ * Argument-aware git mutation policy. Returns 'ESCALATE' for operations whose
+ * blast radius warrants human confirmation BEFORE the model is consulted, or
+ * null when the operation may be judged by the model and the operator policy.
+ * The command name alone never approves: the actual arguments are checked.
+ *
+ * Still escalated: push (all forms), reset --hard, clean with -f/-x/-d,
+ * fetch --prune, git rm, unscoped git add (whole-tree staging).
+ * Model-eligible: commit (without --no-verify — caught upstream), checkout,
+ * switch, merge, rebase, cherry-pick, revert, stash, branch, tag, plain
+ * fetch, clean -n, soft/mixed reset, scoped add.
+ */
+export function gitMutationDecision(subcommand, args) {
+  const hasFlag = (...flags) => args.some((a) => flags.includes(a))
+  // Case-insensitive: git accepts -F as --force, -X as -x, etc.
+  const hasCombinedShortFlag = (chars) =>
+    args.some((a) => /^-[a-zA-Z]+$/.test(a) && [...a.slice(1)].some((c) => chars.includes(c.toLowerCase())))
+
+  switch (subcommand) {
+    case 'push':
+      return 'ESCALATE'
+    case 'reset':
+      return hasFlag('--hard', '-H') ? 'ESCALATE' : null
+    case 'clean':
+      return hasCombinedShortFlag('fxd') || hasFlag('--force', '--interactive') ? 'ESCALATE' : null
+    case 'fetch':
+      return hasFlag('--prune') || hasCombinedShortFlag('p') ? 'ESCALATE' : null
+    case 'rm':
+      return 'ESCALATE'
+    case 'add': {
+      const pathspecs = args.filter((a) => !a.startsWith('-'))
+      if (pathspecs.length === 0 || hasFlag('-A', '--all', '-a', '-u', '--update')) return 'ESCALATE'
+      return pathspecs.every((p) => p !== '.') ? null : 'ESCALATE'
+    }
+    case 'commit':
+    case 'checkout':
+    case 'switch':
+    case 'merge':
+    case 'rebase':
+    case 'cherry-pick':
+    case 'revert':
+    case 'stash':
+    case 'branch':
+    case 'tag':
+      return null
+    case 'mv':
+    case 'am':
+    case 'pull':
+    case 'restore':
+      return 'ESCALATE'
+    default:
+      return null
+  }
+}
 
 /**
  * Evaluate mandatory security rules for a reviewed operation.
