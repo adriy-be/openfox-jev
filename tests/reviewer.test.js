@@ -269,17 +269,29 @@ describe('mandatory security rules precede the model', () => {
     assert.equal(result.meta.ruleId, 'privilege_escalation')
   })
 
-  it('escalates state-changing git operations before consulting the model', async () => {
+  it('escalates high-blast-radius git operations before consulting the model', async () => {
     let called = 0
     const access = makeProviderAccess([OPENROUTER], async () => {
       called += 1
       return validResponse()
     })
     const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'x' }, access)
-    const result = await reviewer.evaluate({ ...ROUTINE, command: 'git commit -m "x"' })
+    const result = await reviewer.evaluate({ ...ROUTINE, command: 'git push origin main' })
     assert.equal(result.action, 'ask')
     assert.equal(result.meta.ruleId, 'git_mutation')
     assert.equal(called, 0)
+  })
+
+  it('consults the model for argument-eligible git mutations (commit)', async () => {
+    let called = 0
+    const access = makeProviderAccess([OPENROUTER], async () => {
+      called += 1
+      return validResponse('APPROVE')
+    })
+    const reviewer = makeReviewer({ enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Routine git allowed.' }, access)
+    const result = await reviewer.evaluate({ ...ROUTINE, command: 'git commit -m "x"' })
+    assert.equal(called, 1, 'an eligible commit must reach the model, not a blanket escalation')
+    assert.equal(result.action, 'allow')
   })
 
   it('escalates writes outside the project', async () => {
@@ -329,7 +341,7 @@ describe('shadow mode', () => {
   it('never enforces a deterministic ESCALATE rule — still asks', async () => {
     const access = makeProviderAccess([OPENROUTER], async () => validResponse('APPROVE'))
     const reviewer = makeReviewer({ enabled: true, mode: 'shadow', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Everything allowed.' }, access)
-    const result = await reviewer.evaluate({ ...ROUTINE, command: 'git commit -m "x"' })
+    const result = await reviewer.evaluate({ ...ROUTINE, command: 'git push origin main' })
     assert.equal(result.action, 'ask')
     assert.equal(result.meta.decision, 'ESCALATE')
     assert.equal(result.meta.ruleId, 'git_mutation')

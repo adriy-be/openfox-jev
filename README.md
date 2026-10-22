@@ -97,6 +97,36 @@ Runs the full assessment, records the predicted verdict in the audit log, and
 **always returns `ask`** so OpenFox's native approval flow is untouched. Use it
 to collect real approval cases before switching to enforce.
 
+## Default operator policy (conservative)
+
+Automatic approval is **opt-in per operation class** and **fail-closed by
+default**: with no operator policy the plugin can only escalate. The policy
+below is the recommended starting point — narrow, explicit trust rules that
+auto-approve only read-only, non-mutating work and leave every state-changing
+operation to a human. Paste it into *Operator policy*, then widen it only for
+classes you have watched in shadow mode.
+
+```
+Routine read-only git commands (status, log, diff) are allowed.
+Everything else requires confirmation.
+```
+
+A slightly wider but still conservative default that also permits a scoped
+commit (never `--no-verify`, never force, never push):
+
+```
+Routine read-only git commands (status, log, diff) are allowed.
+A git commit that stages a specific file and does not use --no-verify is
+allowed. Push, force-push, reset --hard, clean, rebase, merge and every other
+state-changing command require confirmation.
+```
+
+What this default deliberately does **not** auto-approve: pushes of any kind,
+`reset --hard`, `clean -f/-x`, `fetch --prune`, `git rm`, unscoped `git add`,
+`--no-verify`, and force-push. Those are escalated to a human **before** the
+model is consulted, so no model verdict — however confident — can silently
+auto-approve history-rewriting or data-destroying operations.
+
 ## Security properties
 
 - Mandatory OpenFox rules are evaluated **before** the plugin and cannot be
@@ -122,8 +152,9 @@ to collect real approval cases before switching to enforce.
 ## Tests
 
 ```bash
-npm test        # node:test — 216 tests: providers, client, policy,
-                # security, reviewer, integration (real loopback server)
+npm test        # node:test — 256 tests: providers, client, policy,
+                # security, reviewer, integration (real loopback server,
+                # 15-row mocked-DeepInfra regression matrix)
 ```
 
 ## Benchmark

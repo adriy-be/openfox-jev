@@ -339,14 +339,104 @@ const HARD_DENY = [
   },
   {
     id: 'git_mutation',
-    reason: 'State-changing git operations require human confirmation.',
-    test: (op) =>
-      /\bgit\b\s+(?:commit|push|merge|rebase|reset|checkout|switch|restore|stash|tag|branch|cherry-pick|revert|clean|mv|rm|add|am|pull|fetch\s+--prune)\b/.test(
-        op.command ?? '',
-      ),
+    reason: 'High-blast-radius git operations require human confirmation.',
+    test: (op) => {
+      const invocation = firstGitInvocation(op.command ?? '')
+      return invocation !== null && gitMutationDecision(invocation.subcommand, invocation.args) === 'ESCALATE'
+    },
     decision: 'ESCALATE',
   },
 ]
+
+/** Global git options that consume the next token as their value. */
+const GIT_VALUE_OPTIONS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--exec-path', '--namespace'])
+
+/**
+ * Find the first `git` invocation in a (possibly compound) shell command.
+ * Returns { subcommand, args } or null. Skips git global options (-C, -c,
+ * --git-dir=…) so the subcommand is the first non-option token after `git`.
+ * Compound commands are split on shell separators; quotes are not fully
+ * honored — an acceptable conservative direction for rule matching, since a
+ * dangerous subcommand can never be hidden inside another token.
+ */
+export function firstGitInvocation(command) {
+  const parts = command.split(/\s*(?:&&|\|\||;|\|)\s*/)
+  for (const part of parts) {
+    const tokens = part.trim().split(/\s+/).filter(Boolean)
+    let i = 0
+    while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i += 1
+    while (i < tokens.length) {
+      const token = tokens[i]
+      if (token === 'git' || (token.includes('/') && token.split('/').pop() === 'git')) break
+      if (token.startsWith('-') && !token.startsWith('--')) i += GIT_VALUE_OPTIONS.has(token) ? 2 : 1
+      else i += 1
+    }
+    if (tokens[i] !== 'git' && !(tokens[i] ?? '').includes('/')) continue
+    if ((tokens[i] ?? '').split('/').pop() !== 'git') continue
+    i += 1
+    while (i < tokens.length && tokens[i].startsWith('-')) {
+      if (tokens[i].includes('=')) i += 1
+      else i += GIT_VALUE_OPTIONS.has(tokens[i]) ? 2 : 1
+    }
+    const subcommand = tokens[i]
+    if (!subcommand || subcommand.startsWith('-')) return null
+    return { subcommand, args: tokens.slice(i + 1) }
+  }
+  return null
+}
+
+/**
+ * Argument-aware git mutation policy. Returns 'ESCALATE' for operations whose
+ * blast radius warrants human confirmation BEFORE the model is consulted, or
+ * null when the operation may be judged by the model and the operator policy.
+ * The command name alone never approves: the actual arguments are checked.
+ *
+ * Still escalated: push (all forms), reset --hard, clean with -f/-x/-d,
+ * fetch --prune, git rm, unscoped git add (whole-tree staging).
+ * Model-eligible: commit (without --no-verify — caught upstream), checkout,
+ * switch, merge, rebase, cherry-pick, revert, stash, branch, tag, plain
+ * fetch, clean -n, soft/mixed reset, scoped add.
+ */
+export function gitMutationDecision(subcommand, args) {
+  const hasFlag = (...flags) => args.some((a) => flags.includes(a))
+  const hasCombinedShortFlag = (chars) => args.some((a) => /^-[a-z]+$/.test(a) && [...a.slice(1)].some((c) => chars.includes(c)))
+
+  switch (subcommand) {
+    case 'push':
+      return 'ESCALATE'
+    case 'reset':
+      return hasFlag('--hard', '-H') ? 'ESCALATE' : null
+    case 'clean':
+      return hasCombinedShortFlag('fxd') || hasFlag('--force', '--interactive') ? 'ESCALATE' : null
+    case 'fetch':
+      return hasFlag('--prune') || hasCombinedShortFlag('p') ? 'ESCALATE' : null
+    case 'rm':
+      return 'ESCALATE'
+    case 'add': {
+      const pathspecs = args.filter((a) => !a.startsWith('-'))
+      if (pathspecs.length === 0 || hasFlag('-A', '--all', '-a', '-u', '--update')) return 'ESCALATE'
+      return pathspecs.every((p) => p !== '.') ? null : 'ESCALATE'
+    }
+    case 'commit':
+    case 'checkout':
+    case 'switch':
+    case 'merge':
+    case 'rebase':
+    case 'cherry-pick':
+    case 'revert':
+    case 'stash':
+    case 'branch':
+    case 'tag':
+      return null
+    case 'mv':
+    case 'am':
+    case 'pull':
+    case 'restore':
+      return 'ESCALATE'
+    default:
+      return null
+  }
+}
 
 /**
  * Evaluate mandatory security rules for a reviewed operation.

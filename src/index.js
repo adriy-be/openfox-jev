@@ -223,10 +223,16 @@ const SETTINGS_FIELDS = [
 export function register(registry) {
   const context = registry.context
 
-  const getSettings = () => ({
-    ...context.settings('global'),
-    ...(context.settings('project') ?? {}),
-  })
+  // Global settings are the base. Project settings — read ONLY when the
+  // approval context carries a projectId, and ONLY explicitly stored values
+  // (onlyStored), so an unset project key never clobbers a stored global with
+  // the schema default.
+  const getSettings = (approvalContext) => {
+    const globals = context.settings('global')
+    const projectId = approvalContext?.projectId
+    const project = projectId ? (context.settings('project', projectId, { onlyStored: true }) ?? {}) : {}
+    return { ...globals, ...project }
+  }
 
   const auditEnabledSetting = () => {
     const value = getSettings().auditEnabled
@@ -251,7 +257,9 @@ export function register(registry) {
 
   registry.registerSettings({ fields: SETTINGS_FIELDS })
 
-  registry.registerApprovalReviewer({
+  // A host that offers no reviewer slot keeps its native confirmations; the
+  // plugin must not crash the host's plugin load because of a missing slot.
+  registry.registerApprovalReviewer?.({
     id: 'openfox-jev',
     evaluate: (approvalContext) => reviewer.evaluate(approvalContext),
   })
@@ -266,6 +274,11 @@ export function register(registry) {
     return { installed: true, running: probe.ok, statusTone: tone, statusText: localized(text + detail, text + detail) }
   })
 
+  // Truthful connection status: `running` is true only after a successful
+  // connection test (testConnection RPC). Until then the status is
+  // not-tested / unconfigured / consent-required / disabled — never a claim
+  // that the backend works without evidence. No background monitoring: the
+  // last probe result is simply reported with its age.
   registry.registerRpc('connectionStatus', async () => {
     const config = readConfig(getSettings())
     if (!config.enabled) {
@@ -283,7 +296,19 @@ export function register(registry) {
     const model = config.model || defaultModelFor(provider, { backendKind: kind })
     let text = `${label} · ${model} · ${config.mode}`
     if (!config.operatorPolicy.trim()) text += ' · no operator policy (escalation only)'
-    return { installed: true, running: true, statusTone: 'success', statusText: localized(text, text) }
+    const { lastProbe } = reviewer.getDiagnostics()
+    if (!lastProbe) {
+      text += ' · not tested'
+      return { installed: true, running: false, statusTone: 'warning', statusText: localized(text, text) }
+    }
+    const ageSeconds = Math.max(0, Math.round((Date.now() - lastProbe.at) / 1000))
+    const age = `${ageSeconds}s ago`
+    if (lastProbe.ok) {
+      text += ` · verified (${lastProbe.latencyMs} ms, ${age})`
+      return { installed: true, running: true, statusTone: 'success', statusText: localized(text, text) }
+    }
+    text += ` · ${lastProbe.statusClass} (${lastProbe.latencyMs ?? 'n/a'} ms, ${age}) — ${lastProbe.message}`
+    return { installed: true, running: false, statusTone: 'danger', statusText: localized(text, text) }
   })
 
   registry.registerRpc('listBackends', () => ({
