@@ -304,6 +304,33 @@ describe('end-to-end approval lifecycle (mocked provider)', () => {
     assert.equal(status.running, false)
     assert.match(status.statusText.en, /consent/i)
   })
+
+  it('connection status exposes in-process counters and the last decision (no secrets)', async () => {
+    const registered = makeRegistry(
+      { enabled: true, mode: 'enforce', providerId: 'or-1', cloudConsent: true, operatorPolicy: 'Routine git allowed.' },
+      providerAccessStub([OPENROUTER], async () => jevAnswer('APPROVE')),
+    )
+    const reviewer = registered.reviewers[0]
+    await reviewer.evaluate(ROUTINE) // allow
+    await reviewer.evaluate({ ...ROUTINE, command: 'rm -rf /' }) // mandatory deny
+
+    const status = await registered.rpc.get('connectionStatus')()
+    assert.ok(status.diagnostics, 'connectionStatus must carry the diagnostic snapshot')
+    assert.deepEqual(status.diagnostics.counters, {
+      confirmations: 2,
+      reviewer_invocations: 1,
+      skipped_before_reviewer: 1,
+      backend_requests_attempted: 1,
+      backend_requests_succeeded: 1,
+      backend_requests_failed: 0,
+      auto_approved: 1,
+      manual_escalations: 0,
+      denied: 1,
+    })
+    assert.equal(status.diagnostics.lastDecision.action, 'deny')
+    assert.equal(status.diagnostics.lastDecision.ruleId, 'wipe_home_or_root')
+    assert.ok(!JSON.stringify(status.diagnostics).includes('rm -rf /'), 'diagnostics must not carry operation text')
+  })
 })
 
 describe('local Jev-Style backend over real loopback HTTP', () => {

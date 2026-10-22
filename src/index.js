@@ -280,35 +280,41 @@ export function register(registry) {
   // that the backend works without evidence. No background monitoring: the
   // last probe result is simply reported with its age.
   registry.registerRpc('connectionStatus', async () => {
+    // Diagnostics (in-process counters + the last decision/probe) ride on the
+    // existing status RPC — no new service. Counters are process-lifetime
+    // aggregates; lastDecision carries status classes, rule ids and latencies
+    // only — never operation text or credentials.
+    const diagnostics = reviewer.getDiagnostics()
+    const withDiagnostics = (status) => ({ ...status, diagnostics })
     const config = readConfig(getSettings())
     if (!config.enabled) {
-      return { installed: true, running: false, statusTone: 'warning', statusText: localized('Disabled', 'Désactivé') }
+      return withDiagnostics({ installed: true, running: false, statusTone: 'warning', statusText: localized('Disabled', 'Désactivé') })
     }
     const provider = config.providerId && context.providerAccess ? context.providerAccess.getProvider(config.providerId) : undefined
     const kind = config.backendKind || (provider ? detectKind(provider) : 'local')
     if (isRemoteBackend(provider, { backendKind: config.backendKind || undefined }) && !config.cloudConsent) {
-      return { installed: true, running: false, statusTone: 'warning', statusText: localized('Cloud consent required', 'Consentement cloud requis') }
+      return withDiagnostics({ installed: true, running: false, statusTone: 'warning', statusText: localized('Cloud consent required', 'Consentement cloud requis') })
     }
     if (!provider && kind !== 'local') {
-      return { installed: true, running: false, statusTone: 'danger', statusText: localized('No provider selected', 'Aucun fournisseur sélectionné') }
+      return withDiagnostics({ installed: true, running: false, statusTone: 'danger', statusText: localized('No provider selected', 'Aucun fournisseur sélectionné') })
     }
     const label = provider?.name ?? 'Local Jev-Style'
     const model = config.model || defaultModelFor(provider, { backendKind: kind })
     let text = `${label} · ${model} · ${config.mode}`
     if (!config.operatorPolicy.trim()) text += ' · no operator policy (escalation only)'
-    const { lastProbe } = reviewer.getDiagnostics()
+    const { lastProbe } = diagnostics
     if (!lastProbe) {
       text += ' · not tested'
-      return { installed: true, running: false, statusTone: 'warning', statusText: localized(text, text) }
+      return withDiagnostics({ installed: true, running: false, statusTone: 'warning', statusText: localized(text, text) })
     }
     const ageSeconds = Math.max(0, Math.round((Date.now() - lastProbe.at) / 1000))
     const age = `${ageSeconds}s ago`
     if (lastProbe.ok) {
       text += ` · verified (${lastProbe.latencyMs} ms, ${age})`
-      return { installed: true, running: true, statusTone: 'success', statusText: localized(text, text) }
+      return withDiagnostics({ installed: true, running: true, statusTone: 'success', statusText: localized(text, text) })
     }
     text += ` · ${lastProbe.statusClass} (${lastProbe.latencyMs ?? 'n/a'} ms, ${age}) — ${lastProbe.message}`
-    return { installed: true, running: false, statusTone: 'danger', statusText: localized(text, text) }
+    return withDiagnostics({ installed: true, running: false, statusTone: 'danger', statusText: localized(text, text) })
   })
 
   registry.registerRpc('listBackends', () => ({
