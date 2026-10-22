@@ -341,8 +341,12 @@ const HARD_DENY = [
     id: 'git_mutation',
     reason: 'High-blast-radius git operations require human confirmation.',
     test: (op) => {
-      const invocation = firstGitInvocation(op.command ?? '')
-      return invocation !== null && gitMutationDecision(invocation.subcommand, invocation.args) === 'ESCALATE'
+      // A compound command is as dangerous as its most dangerous part: every
+      // git invocation is checked, and one escalated subcommand escalates the
+      // whole command — a benign first command can never hide a later push.
+      return allGitInvocations(op.command ?? '').some(
+        (inv) => gitMutationDecision(inv.subcommand, inv.args) === 'ESCALATE',
+      )
     },
     decision: 'ESCALATE',
   },
@@ -351,16 +355,28 @@ const HARD_DENY = [
 /** Global git options that consume the next token as their value. */
 const GIT_VALUE_OPTIONS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--exec-path', '--namespace'])
 
+/** Remove one matching pair of surrounding quotes from a token. */
+function stripQuotes(token) {
+  if (token.length >= 2) {
+    const first = token[0]
+    const last = token[token.length - 1]
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) return token.slice(1, -1)
+  }
+  return token
+}
+
 /**
- * Find the first `git` invocation in a (possibly compound) shell command.
- * Returns { subcommand, args } or null. Skips git global options (-C, -c,
+ * Find every `git` invocation in a (possibly compound) shell command.
+ * Returns an array of { subcommand, args }. Skips git global options (-C, -c,
  * --git-dir=…) so the subcommand is the first non-option token after `git`.
- * Compound commands are split on shell separators; quotes are not fully
- * honored — an acceptable conservative direction for rule matching, since a
- * dangerous subcommand can never be hidden inside another token.
+ * Compound commands are split on shell separators; a surrounding pair of
+ * quotes on the subcommand is stripped so `git "push"` is recognized as push.
+ * Each command segment carries at most one git invocation, so the returned
+ * array covers every git the shell would run.
  */
-export function firstGitInvocation(command) {
+export function allGitInvocations(command) {
   const parts = command.split(/\s*(?:&&|\|\||;|\|)\s*/)
+  const invocations = []
   for (const part of parts) {
     const tokens = part.trim().split(/\s+/).filter(Boolean)
     let i = 0
@@ -378,11 +394,16 @@ export function firstGitInvocation(command) {
       if (tokens[i].includes('=')) i += 1
       else i += GIT_VALUE_OPTIONS.has(tokens[i]) ? 2 : 1
     }
-    const subcommand = tokens[i]
-    if (!subcommand || subcommand.startsWith('-')) return null
-    return { subcommand, args: tokens.slice(i + 1) }
+    const subcommand = stripQuotes(tokens[i] ?? '')
+    if (!subcommand || subcommand.startsWith('-')) continue
+    invocations.push({ subcommand, args: tokens.slice(i + 1) })
   }
-  return null
+  return invocations
+}
+
+/** Find the first `git` invocation (or null) — kept for callers that only need the head. */
+export function firstGitInvocation(command) {
+  return allGitInvocations(command)[0] ?? null
 }
 
 /**
@@ -399,7 +420,9 @@ export function firstGitInvocation(command) {
  */
 export function gitMutationDecision(subcommand, args) {
   const hasFlag = (...flags) => args.some((a) => flags.includes(a))
-  const hasCombinedShortFlag = (chars) => args.some((a) => /^-[a-z]+$/.test(a) && [...a.slice(1)].some((c) => chars.includes(c)))
+  // Case-insensitive: git accepts -F as --force, -X as -x, etc.
+  const hasCombinedShortFlag = (chars) =>
+    args.some((a) => /^-[a-zA-Z]+$/.test(a) && [...a.slice(1)].some((c) => chars.includes(c.toLowerCase())))
 
   switch (subcommand) {
     case 'push':

@@ -73,7 +73,10 @@ never triggers a GPU workload.
 - *Decision model* — free text (default `nace-ai/drex-v2.0`; local servers
   ignore it).
 - *Local Jev URL* — loopback only, default `http://127.0.0.1:8765`.
-- *Connection test* — shows provider · model · mode · latency.
+- *Connection test* — shows provider · model · mode · latency. Both the
+  connection test and the status line resolve **global** settings (the host
+  RPCs carry no project context), so a project-scoped provider/model override
+  is used for decisions but not shown here.
 
 **Approval policy**
 - *Operator policy* — trusted instructions for the model (e.g. "Routine
@@ -152,7 +155,7 @@ auto-approve history-rewriting or data-destroying operations.
 ## Tests
 
 ```bash
-npm test        # node:test — 256 tests: providers, client, policy,
+npm test        # node:test — 261 tests: providers, client, policy,
                 # security, reviewer, integration (real loopback server,
                 # 15-row mocked-DeepInfra regression matrix)
 ```

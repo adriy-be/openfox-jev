@@ -10,8 +10,9 @@ Two repos: the plugin `openfox-jev` and the OpenFox host.
 (`provider-access.ts` `findProvider`, used only by `requestJson`) threw
 `'Provider is disabled'` for any `isActive:false` provider. DeepInfra is not
 the chat model (`isActive:false`), so every plugin request died before the
-network. Evidence: 142 audit rows with `ruleId: provider_disabled`
-(`~/.local/state/openfox-jev/decisions.jsonl`); the last 35 of 40 rows. The
+network. Evidence: 142 audit rows with `ruleId: provider_disabled` in the
+plugin audit log (`decisions.jsonl` in the OpenFox state directory); the last
+35 of 40 rows. The
 running host (systemd user service, started 2026-10-18) still executed this
 code. The plugin-side check had already been removed, but the host-side gate
 remained.
@@ -35,7 +36,8 @@ append).
 
 ## Files changed
 
-**Host `/tmp/openfox`** — branch `fix/approval-diagnostics`, commit `e29a8d4`:
+**Host (OpenFox working copy)** — branch `fix/approval-diagnostics`, commit
+`e29a8d4`:
 - `src/server/plugins/provider-access.ts` — RC1 gate removed from `findProvider`.
 - `src/server/plugins/settings.ts`, `src/plugin/index.ts`,
   `src/server/plugins/host.ts` — `onlyStored` flag for project settings.
@@ -45,8 +47,8 @@ append).
 - `src/server/tools/shell.ts` — command gate passes the raw command.
 - Test files (57 tests green).
 
-**Plugin `/srv/git/openfox-jev`** — branch `fix/drex-approval-reviewer`,
-commit `60ac790` (plus the diagnostics follow-up):
+**Plugin (`openfox-jev`)** — branch `fix/drex-approval-reviewer`, commit
+`60ac790` (plus the diagnostics follow-up):
 - `src/security.js` — argument-aware git policy + `firstGitInvocation` /
   `gitMutationDecision`.
 - `src/reviewer.js` — counters, audit on early exits, truthful probe,
